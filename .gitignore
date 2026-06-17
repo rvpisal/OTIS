@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OTIS runtime cache
+.otis_results.pkl
+.otis_watchlist.txt
+
+# Environment & secrets
+.env
+.env.*
+*.key
+secrets.toml
+.streamlit/secrets.toml
+
+# Streamlit
+.streamlit/
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
