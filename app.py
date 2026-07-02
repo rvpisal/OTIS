@@ -8,6 +8,15 @@ import pandas as pd
 import streamlit as st
 
 from backtester import backtest_ticker
+from zebra_screener import (
+    evaluate_zebra,
+    fetch_zebra_chain,
+    ZEBRA_DTE_MIN,
+    ZEBRA_DTE_MAX,
+    ZEBRA_MIN_OI,
+    ZEBRA_MAX_SPREAD_ABS,
+    ZEBRA_EXTRINSIC_TOL,
+)
 from data_fetcher import DataFetcher, TICKER_UNIVERSE
 from indicators import analyze_ticker, check_phase1_trigger, STRATEGY_TRIGGERS
 from news_events import (
@@ -123,6 +132,40 @@ def cached_ticker_news(ticker: str) -> list[dict]:
 @st.cache_data(ttl=3600, show_spinner=False)       # 1 h
 def cached_earnings(ticker: str):
     return fetch_next_earnings(ticker)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)       # 1 h — chain data changes intraday
+def cached_zebra(
+    ticker: str,
+    dte_min: int,
+    dte_max: int,
+    min_oi: int,
+    max_spread: float,
+    extrinsic_tol: float,
+    earnings_warn: bool,
+    div_warn: bool,
+) -> list[dict]:
+    """Fetch zebra chain + evaluate for one ticker. Keyed by all filter params."""
+    chain = fetch_zebra_chain(ticker, dte_min=dte_min, dte_max=dte_max)
+    if not chain:
+        return []
+    import yfinance as yf
+    hist = yf.Ticker(ticker).history(period="2y")
+    price = float(hist["Close"].iloc[-1]) if hist is not None and not hist.empty else None
+    if price is None:
+        return []
+    signals = analyze_ticker(ticker, hist)
+    earnings = fetch_next_earnings(ticker)
+    return evaluate_zebra(
+        ticker, chain, price,
+        signals=signals,
+        earnings_date=earnings,
+        min_oi=min_oi,
+        max_spread=max_spread,
+        extrinsic_tol=extrinsic_tol,
+        earnings_warn=earnings_warn,
+        div_warn=div_warn,
+    )
 
 
 @st.cache_data(ttl=86400, show_spinner=False)      # 1 day — one max-history fetch per ticker
@@ -1549,6 +1592,215 @@ def render_news_section():
                 st.caption("Sources: Yahoo Finance & CNBC RSS · refreshes every 15 minutes.")
 
 
+# ── Zebra — Stock Replacement Screener ───────────────────────────────────────
+
+def _zebra_card(r: dict) -> None:
+    """Render one Zebra trade card inside a bordered container."""
+    ext_label = f"${r['net_extrinsic']:+.2f}/shr" if r["net_extrinsic"] != 0 else "$0.00/shr ✨"
+    ext_color = "#1e7e34" if abs(r["net_extrinsic"]) <= 0.05 else "#a8d5b0" if abs(r["net_extrinsic"]) <= 0.10 else "#fff3cd"
+
+    warnings = r.get("warnings", [])
+    warn_html = "".join(
+        f'<span style="background:#fff3cd;color:#856404;border-radius:4px;padding:2px 7px;'
+        f'margin:2px;font-size:0.82em;display:inline-block">⚠️ {w}</span>'
+        for w in warnings
+    ) if warnings else '<span style="color:#1e7e34;font-size:0.85em">✅ No warnings</span>'
+
+    with st.container(border=True):
+        # Header
+        hc1, hc2, hc3 = st.columns([2, 2, 1])
+        hc1.markdown(
+            f"### 🦓 {r['ticker']}  "
+            f"<span style='font-size:0.85em;color:#888'>${r['current_price']:,.2f}</span>",
+            unsafe_allow_html=True,
+        )
+        hc2.markdown(
+            f"**Buy 2× ${r['long_strike']:g}C &nbsp;·&nbsp; Sell 1× ${r['short_strike']:g}C**  \n"
+            f"Expiry: {r['expiration']} &nbsp;({r['dte']}d)"
+        )
+        hc3.markdown(
+            f"<div style='background:{ext_color};border-radius:6px;padding:6px 10px;"
+            f"text-align:center;font-weight:bold'>Net Extrinsic<br>{ext_label}</div>",
+            unsafe_allow_html=True,
+        )
+
+        st.divider()
+
+        # Key metrics — two rows of 4
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Net Debit", f"${r['net_debit']:.2f}/shr", help="Total cost to open (2×long – 1×short), per share equivalent")
+        m2.metric("Max Loss", f"${r['max_loss']:,.0f}", help="Net debit × 100 — the most you can lose (defined risk)")
+        m3.metric("Breakeven", f"${r['breakeven']:,.2f}", help="Long strike + net debit — stock must be above this at expiry to profit")
+        m4.metric("Structure Δ", f"{r['structure_delta']:.2f}", help="2×long delta − short delta ≈ delta of owning 100 shares")
+
+        m5, m6, m7, m8 = st.columns(4)
+        m5.metric("Capital Required", f"${r['capital_required']:,.0f}", help="Net debit × 100 — what you pay to open")
+        m6.metric("vs 100 Shares", f"${r['share_cost']:,.0f}", help="Cost of outright stock ownership at current price")
+        m7.metric("Capital Saved", f"{r['capital_efficiency']:.1f}%", help="How much less capital this uses vs buying 100 shares")
+        m8.metric("IV Rank", f"{r['iv_rank']:.0f}", help="Low IV = better entry for this positive-vega structure")
+
+        # Leg details
+        st.markdown("**Leg details**")
+        ld1, ld2 = st.columns(2)
+        ld1.caption(
+            f"**Long ×2 — ${r['long_strike']:g} Call**  \n"
+            f"Mid: ${r['long_mid']:.2f} &nbsp;|&nbsp; "
+            f"Bid/Ask: ${r['long_bid']:.2f} / ${r['long_ask']:.2f} "
+            f"(spread ${r['long_spread']:.2f})  \n"
+            f"Delta: {r['long_delta']:.2f} &nbsp;|&nbsp; OI: {r['long_oi']:,} &nbsp;|&nbsp; "
+            f"Extrinsic: ${r['long_ext']:.2f}"
+        )
+        ld2.caption(
+            f"**Short ×1 — ${r['short_strike']:g} Call**  \n"
+            f"Mid: ${r['short_mid']:.2f} &nbsp;|&nbsp; "
+            f"Bid/Ask: ${r['short_bid']:.2f} / ${r['short_ask']:.2f} "
+            f"(spread ${r['short_spread']:.2f})  \n"
+            f"Delta: {r['short_delta']:.2f} &nbsp;|&nbsp; OI: {r['short_oi']:,} &nbsp;|&nbsp; "
+            f"Extrinsic: ${r['short_ext']:.2f}"
+        )
+
+        gran = r.get("strike_granularity", 5.0)
+        gran_badge = f"✅ ${gran:g} strike increments" if gran <= 2.5 else f"⚠️ ${gran:g} strike increments (coarse)"
+        st.caption(f"Strike grid: {gran_badge}")
+
+        # Warnings
+        st.markdown(warn_html, unsafe_allow_html=True)
+
+
+def _zebra_filters() -> dict:
+    """Render Zebra filter controls and return the active config."""
+    with st.expander("⚙️ Zebra Filters", expanded=False):
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        dte_min      = fc1.number_input("Min DTE",         min_value=30,   max_value=90,   value=ZEBRA_DTE_MIN, step=5,    key="z_dte_min")
+        dte_max      = fc2.number_input("Max DTE",         min_value=60,   max_value=180,  value=ZEBRA_DTE_MAX, step=10,   key="z_dte_max")
+        min_oi       = fc3.number_input("Min OI (legs)",   min_value=50,   max_value=2000, value=ZEBRA_MIN_OI,  step=50,   key="z_min_oi")
+        max_spread   = fc4.number_input("Max Spread $",    min_value=0.05, max_value=0.50, value=ZEBRA_MAX_SPREAD_ABS, step=0.05, format="%.2f", key="z_spread")
+
+        fc5, fc6, fc7 = st.columns([1, 1, 2])
+        extrinsic_tol = fc5.number_input("Extrinsic Tol $", min_value=0.02, max_value=0.50, value=ZEBRA_EXTRINSIC_TOL, step=0.02, format="%.2f", key="z_ext_tol")
+        earnings_warn = fc6.toggle("Earnings warning",     value=True, key="z_earn_warn")
+        div_warn      = fc7.toggle("Dividend risk warning", value=True, key="z_div_warn")
+
+    return {
+        "dte_min": int(dte_min), "dte_max": int(dte_max),
+        "min_oi": int(min_oi), "max_spread": float(max_spread),
+        "extrinsic_tol": float(extrinsic_tol),
+        "earnings_warn": bool(earnings_warn), "div_warn": bool(div_warn),
+    }
+
+
+def render_zebra_section(signals_data: dict) -> None:
+    st.caption(
+        "A **Zebra** (Zero-Extrinsic Back Ratio) mimics owning 100 shares with defined downside risk "
+        "and 30–70% less capital: **Buy 2× deep ITM call (~80–85Δ) + Sell 1× ATM call (~50Δ)**, "
+        "same expiry. The ratio is sized so net extrinsic ≈ $0, making it delta-equivalent to stock "
+        "without unlimited downside. Best in **bullish, low-to-moderate IV** environments."
+    )
+
+    cfg = _zebra_filters()
+
+    # ── Manual ticker input ───────────────────────────────────────────────────
+    col_in, col_btn = st.columns([3, 1])
+    z_ticker = col_in.text_input(
+        "Analyse ticker", placeholder="e.g. AAPL, NVDA, SPY …",
+        label_visibility="collapsed", key="z_ticker_input",
+    ).strip().upper()
+    run_single = col_btn.button("🦓 Analyse", type="primary",
+                                use_container_width=True, key="z_single_btn")
+
+    # ── Watchlist scan (bullish tickers from last screen run) ─────────────────
+    bullish_tickers = sorted([
+        t for t, s in signals_data.items()
+        if s and s.get("macro_trend") == "BULLISH"
+    ])
+    if bullish_tickers:
+        st.caption(
+            f"**{len(bullish_tickers)} bullish tickers** from the last watchlist screen "
+            f"({', '.join(bullish_tickers[:8])}{'…' if len(bullish_tickers) > 8 else ''}) "
+            "are candidates for Zebra setups."
+        )
+        scan_btn = st.button(
+            f"🔍 Scan all {len(bullish_tickers)} bullish tickers for Zebra setups",
+            key="z_scan_btn",
+        )
+    else:
+        scan_btn = False
+        if signals_data:
+            st.caption("No bullish tickers in the last screen — use manual lookup above or run the screen first.")
+
+    # ── Handle single ticker ──────────────────────────────────────────────────
+    if run_single and z_ticker:
+        with st.spinner(f"Fetching Zebra chain for **{z_ticker}**… (60–{cfg['dte_max']}d monthly expirations)"):
+            result = cached_zebra(
+                z_ticker,
+                cfg["dte_min"], cfg["dte_max"],
+                cfg["min_oi"], cfg["max_spread"],
+                cfg["extrinsic_tol"],
+                cfg["earnings_warn"], cfg["div_warn"],
+            )
+        st.session_state["zebra_single"] = (z_ticker, result)
+        st.session_state.pop("zebra_scan", None)
+
+    # ── Handle watchlist scan ─────────────────────────────────────────────────
+    if scan_btn and bullish_tickers:
+        scan_results: list[dict] = []
+        prog = st.progress(0, text="Starting scan…")
+        for i, t in enumerate(bullish_tickers):
+            prog.progress((i + 1) / len(bullish_tickers), text=f"Scanning {t} ({i+1}/{len(bullish_tickers)})…")
+            rows = cached_zebra(
+                t,
+                cfg["dte_min"], cfg["dte_max"],
+                cfg["min_oi"], cfg["max_spread"],
+                cfg["extrinsic_tol"],
+                cfg["earnings_warn"], cfg["div_warn"],
+            )
+            scan_results.extend(rows)
+        prog.empty()
+        # Best structure per ticker (closest to zero extrinsic)
+        seen: set[str] = set()
+        deduped: list[dict] = []
+        for r in sorted(scan_results, key=lambda x: abs(x["net_extrinsic"])):
+            if r["ticker"] not in seen:
+                seen.add(r["ticker"])
+                deduped.append(r)
+        st.session_state["zebra_scan"] = deduped
+        st.session_state.pop("zebra_single", None)
+
+    # ── Display results ───────────────────────────────────────────────────────
+    if "zebra_single" in st.session_state:
+        ticker_shown, rows = st.session_state["zebra_single"]
+        st.subheader(f"🦓 {ticker_shown} — Zebra Structures")
+        if not rows:
+            st.warning(
+                f"No qualifying Zebra structures found for **{ticker_shown}** with current filters. "
+                "Try relaxing Min OI, increasing Extrinsic Tolerance, or checking a different DTE range."
+            )
+        else:
+            st.caption(f"{len(rows)} structure{'s' if len(rows) > 1 else ''} — sorted by |net extrinsic| (closest to zero first)")
+            for r in rows:
+                _zebra_card(r)
+
+    elif "zebra_scan" in st.session_state:
+        scan_rows = st.session_state["zebra_scan"]
+        st.subheader(f"🦓 Watchlist Zebra Scan — {len(scan_rows)} tickers with valid structures")
+        if not scan_rows:
+            st.warning(
+                "No qualifying Zebra structures found for any bullish ticker. "
+                "Relax filters or wait for higher liquidity in the relevant DTE window."
+            )
+        else:
+            # Sort by capital efficiency (best savings first)
+            for r in sorted(scan_rows, key=lambda x: -x["capital_efficiency"]):
+                _zebra_card(r)
+
+    st.caption(
+        "⚠️ **Structure note:** Net extrinsic ≈ $0 is the target — a slightly negative value "
+        "(credit on the extrinsic balance) is acceptable; a large positive means you're paying "
+        "excess time value on the longs. Structure delta ~1.1–1.2 is typical (slightly more than "
+        "100 shares). Max loss is the net debit × 100 — always defined, unlike long stock."
+    )
+
+
 # ── Backtest ──────────────────────────────────────────────────────────────────
 
 def _verdict(win45: float) -> str:
@@ -2004,6 +2256,14 @@ def main():
             "Not limited to the Goldilocks watchlist."
         )
         render_single_ticker_section(filters)
+
+    # ── Zebra screener (always available) ────────────────────────────────────
+    st.divider()
+    with st.expander(
+        "🦓 Zebra — Stock Replacement Screener",
+        expanded=bool(st.session_state.get("zebra_single") or st.session_state.get("zebra_scan")),
+    ):
+        render_zebra_section(st.session_state.get("signals_data", {}))
 
     # ── Backtest (always available) ───────────────────────────────────────────
     st.divider()
