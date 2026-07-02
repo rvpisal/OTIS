@@ -9,6 +9,7 @@ import streamlit as st
 
 from backtester import backtest_ticker
 from zebra_screener import (
+    apply_zebra_filters,
     evaluate_zebra,
     fetch_zebra_chain,
     ZEBRA_DTE_MIN,
@@ -135,37 +136,24 @@ def cached_earnings(ticker: str):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)       # 1 h — chain data changes intraday
-def cached_zebra(
-    ticker: str,
-    dte_min: int,
-    dte_max: int,
-    min_oi: int,
-    max_spread: float,
-    extrinsic_tol: float,
-    earnings_warn: bool,
-    div_warn: bool,
-) -> list[dict]:
-    """Fetch zebra chain + evaluate for one ticker. Keyed by all filter params."""
+def cached_zebra(ticker: str, dte_min: int, dte_max: int) -> list[dict]:
+    """
+    Fetch chain + evaluate ALL structurally valid Zebra setups for one ticker.
+    Keyed only by ticker and DTE window — soft filter gates (OI, spread,
+    extrinsic tolerance) are applied at display time via apply_zebra_filters()
+    so the user can change filters without re-fetching.
+    """
     chain = fetch_zebra_chain(ticker, dte_min=dte_min, dte_max=dte_max)
     if not chain:
         return []
-    import yfinance as yf
-    hist = yf.Ticker(ticker).history(period="2y")
-    price = float(hist["Close"].iloc[-1]) if hist is not None and not hist.empty else None
-    if price is None:
+    import yfinance as _yf
+    hist = _yf.Ticker(ticker).history(period="2y")
+    if hist is None or hist.empty:
         return []
+    price = float(hist["Close"].iloc[-1])
     signals = analyze_ticker(ticker, hist)
     earnings = fetch_next_earnings(ticker)
-    return evaluate_zebra(
-        ticker, chain, price,
-        signals=signals,
-        earnings_date=earnings,
-        min_oi=min_oi,
-        max_spread=max_spread,
-        extrinsic_tol=extrinsic_tol,
-        earnings_warn=earnings_warn,
-        div_warn=div_warn,
-    )
+    return evaluate_zebra(ticker, chain, price, signals=signals, earnings_date=earnings)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)      # 1 day — one max-history fetch per ticker
@@ -1596,22 +1584,46 @@ def render_news_section():
 
 def _zebra_card(r: dict) -> None:
     """Render one Zebra trade card inside a bordered container."""
+    filter_status = r.get("filter_status", "")
+    passes = filter_status.startswith("✅")
+
     ext_label = f"${r['net_extrinsic']:+.2f}/shr" if r["net_extrinsic"] != 0 else "$0.00/shr ✨"
     ext_color = "#1e7e34" if abs(r["net_extrinsic"]) <= 0.05 else "#a8d5b0" if abs(r["net_extrinsic"]) <= 0.10 else "#fff3cd"
+
+    # Muted styling for rows that fail filters
+    card_style = "" if passes else "opacity:0.7"
+    header_color = "#1a1a1a" if passes else "#666"
 
     warnings = r.get("warnings", [])
     warn_html = "".join(
         f'<span style="background:#fff3cd;color:#856404;border-radius:4px;padding:2px 7px;'
         f'margin:2px;font-size:0.82em;display:inline-block">⚠️ {w}</span>'
         for w in warnings
-    ) if warnings else '<span style="color:#1e7e34;font-size:0.85em">✅ No warnings</span>'
+    ) if warnings else '<span style="color:#1e7e34;font-size:0.85em">✅ No risk warnings</span>'
 
     with st.container(border=True):
+        # Filter status badge — prominently at the top for failing rows
+        if filter_status:
+            if passes:
+                st.markdown(
+                    f'<span style="background:#c3e6cb;color:#155724;border-radius:4px;'
+                    f'padding:3px 10px;font-size:0.85em;font-weight:bold">{filter_status}</span>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'<span style="background:#ffeeba;color:#856404;border-radius:4px;'
+                    f'padding:3px 10px;font-size:0.85em;font-weight:bold">{filter_status}</span>',
+                    unsafe_allow_html=True,
+                )
+
         # Header
         hc1, hc2, hc3 = st.columns([2, 2, 1])
         hc1.markdown(
+            f"<span style='color:{header_color}'>"
             f"### 🦓 {r['ticker']}  "
-            f"<span style='font-size:0.85em;color:#888'>${r['current_price']:,.2f}</span>",
+            f"<span style='font-size:0.85em;color:#888'>${r['current_price']:,.2f}</span>"
+            f"</span>",
             unsafe_allow_html=True,
         )
         hc2.markdown(
@@ -1730,68 +1742,81 @@ def render_zebra_section(signals_data: dict) -> None:
 
     # ── Handle single ticker ──────────────────────────────────────────────────
     if run_single and z_ticker:
-        with st.spinner(f"Fetching Zebra chain for **{z_ticker}**… (60–{cfg['dte_max']}d monthly expirations)"):
-            result = cached_zebra(
-                z_ticker,
-                cfg["dte_min"], cfg["dte_max"],
-                cfg["min_oi"], cfg["max_spread"],
-                cfg["extrinsic_tol"],
-                cfg["earnings_warn"], cfg["div_warn"],
-            )
-        st.session_state["zebra_single"] = (z_ticker, result)
+        with st.spinner(f"Fetching Zebra chain for **{z_ticker}**… ({cfg['dte_min']}–{cfg['dte_max']}d monthlies)"):
+            raw = cached_zebra(z_ticker, cfg["dte_min"], cfg["dte_max"])
+        st.session_state["zebra_single"] = (z_ticker, raw)
         st.session_state.pop("zebra_scan", None)
 
     # ── Handle watchlist scan ─────────────────────────────────────────────────
     if scan_btn and bullish_tickers:
-        scan_results: list[dict] = []
+        scan_raw: list[dict] = []
         prog = st.progress(0, text="Starting scan…")
         for i, t in enumerate(bullish_tickers):
             prog.progress((i + 1) / len(bullish_tickers), text=f"Scanning {t} ({i+1}/{len(bullish_tickers)})…")
-            rows = cached_zebra(
-                t,
-                cfg["dte_min"], cfg["dte_max"],
-                cfg["min_oi"], cfg["max_spread"],
-                cfg["extrinsic_tol"],
-                cfg["earnings_warn"], cfg["div_warn"],
-            )
-            scan_results.extend(rows)
+            scan_raw.extend(cached_zebra(t, cfg["dte_min"], cfg["dte_max"]))
         prog.empty()
-        # Best structure per ticker (closest to zero extrinsic)
+        st.session_state["zebra_scan"] = scan_raw
+        st.session_state.pop("zebra_single", None)
+
+    # ── Display results (filter_status applied here so filter changes are instant) ──
+    def _show_zebra_rows(raw_rows: list[dict], header: str) -> None:
+        rows = apply_zebra_filters(
+            raw_rows,
+            min_oi=cfg["min_oi"],
+            max_spread=cfg["max_spread"],
+            extrinsic_tol=cfg["extrinsic_tol"],
+            earnings_warn=cfg["earnings_warn"],
+            div_warn=cfg["div_warn"],
+        )
+        if not rows:
+            st.warning(
+                f"No structurally valid Zebra setups found. "
+                "Try widening the DTE range or checking a different ticker."
+            )
+            return
+        n_pass = sum(1 for r in rows if r["filter_status"].startswith("✅"))
+        n_fail = len(rows) - n_pass
+        st.subheader(header)
+        st.caption(
+            f"**{n_pass} passing** current filters &nbsp;·&nbsp; "
+            f"**{n_fail} not matching** (shown below with reasons) &nbsp;·&nbsp; "
+            "✅ first, then ⚠️ with specific filter mismatches highlighted"
+        )
+        for r in rows:
+            _zebra_card(r)
+
+    if "zebra_single" in st.session_state:
+        ticker_shown, raw_rows = st.session_state["zebra_single"]
+        _show_zebra_rows(raw_rows, f"🦓 {ticker_shown} — Zebra Structures")
+
+    elif "zebra_scan" in st.session_state:
+        raw_rows = st.session_state["zebra_scan"]
+        # For the scan, show best structure per ticker (deduplicate after filtering)
+        filtered = apply_zebra_filters(
+            raw_rows,
+            min_oi=cfg["min_oi"],
+            max_spread=cfg["max_spread"],
+            extrinsic_tol=cfg["extrinsic_tol"],
+            earnings_warn=cfg["earnings_warn"],
+            div_warn=cfg["div_warn"],
+        )
+        # One row per ticker — keep the first (best) for each
         seen: set[str] = set()
         deduped: list[dict] = []
-        for r in sorted(scan_results, key=lambda x: abs(x["net_extrinsic"])):
+        for r in filtered:
             if r["ticker"] not in seen:
                 seen.add(r["ticker"])
                 deduped.append(r)
-        st.session_state["zebra_scan"] = deduped
-        st.session_state.pop("zebra_single", None)
-
-    # ── Display results ───────────────────────────────────────────────────────
-    if "zebra_single" in st.session_state:
-        ticker_shown, rows = st.session_state["zebra_single"]
-        st.subheader(f"🦓 {ticker_shown} — Zebra Structures")
-        if not rows:
-            st.warning(
-                f"No qualifying Zebra structures found for **{ticker_shown}** with current filters. "
-                "Try relaxing Min OI, increasing Extrinsic Tolerance, or checking a different DTE range."
-            )
-        else:
-            st.caption(f"{len(rows)} structure{'s' if len(rows) > 1 else ''} — sorted by |net extrinsic| (closest to zero first)")
-            for r in rows:
-                _zebra_card(r)
-
-    elif "zebra_scan" in st.session_state:
-        scan_rows = st.session_state["zebra_scan"]
-        st.subheader(f"🦓 Watchlist Zebra Scan — {len(scan_rows)} tickers with valid structures")
-        if not scan_rows:
-            st.warning(
-                "No qualifying Zebra structures found for any bullish ticker. "
-                "Relax filters or wait for higher liquidity in the relevant DTE window."
-            )
-        else:
-            # Sort by capital efficiency (best savings first)
-            for r in sorted(scan_rows, key=lambda x: -x["capital_efficiency"]):
-                _zebra_card(r)
+        n_pass = sum(1 for r in deduped if r["filter_status"].startswith("✅"))
+        n_fail = len(deduped) - n_pass
+        st.subheader(f"🦓 Watchlist Zebra Scan — {len(deduped)} tickers with valid structures")
+        st.caption(
+            f"**{n_pass} passing** current filters &nbsp;·&nbsp; "
+            f"**{n_fail} not matching** (shown with specific reasons) &nbsp;·&nbsp; "
+            "Best structure per ticker · ✅ first"
+        )
+        for r in deduped:
+            _zebra_card(r)
 
     st.caption(
         "⚠️ **Structure note:** Net extrinsic ≈ $0 is the target — a slightly negative value "

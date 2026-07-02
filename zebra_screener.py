@@ -151,131 +151,111 @@ def evaluate_zebra(
     current_price: float,
     signals: dict | None = None,
     earnings_date: date | None = None,
-    *,
-    min_oi: int = ZEBRA_MIN_OI,
-    max_spread: float = ZEBRA_MAX_SPREAD_ABS,
-    extrinsic_tol: float = ZEBRA_EXTRINSIC_TOL,
-    earnings_warn: bool = True,
-    div_warn: bool = True,
 ) -> list[dict]:
     """
-    Scan every qualifying expiration in the chain and return viable Zebra
-    structures sorted by |net_extrinsic| (closest to zero first).
+    Return ALL structurally valid Zebra setups across qualifying expirations,
+    regardless of liquidity or extrinsic filters.
 
-    Each result dict contains all fields needed to render the trade card:
-    strikes, debit, extrinsic balance, delta, capital metrics, OI/spread,
-    strike granularity, and any warning tags.
+    Only hard structural gates are applied here (they describe invalid trades,
+    not just ones that don't meet the current filter settings):
+      - Must find a strike in the long-delta range (0.75–0.92)
+      - Must find a strike in the short-delta range (0.45–0.55)
+      - Long strike must be below the short (deep ITM < ATM)
+      - Net debit must be positive (2×long − short > 0)
+
+    Soft gates — OI, bid-ask spread, extrinsic tolerance, earnings proximity —
+    are NOT applied here. They are stamped as `filter_status` by
+    `apply_zebra_filters()` so the UI can show every candidate and explain
+    exactly what each one fails.
     """
     calls = chain.get("calls", pd.DataFrame())
     if calls.empty:
         return []
 
     iv_rank = float((signals or {}).get("iv_rank", 50) or 50)
-    ex_div = _get_ex_div_date(ticker) if div_warn else None
+    ex_div  = _get_ex_div_date(ticker)
 
     results: list[dict] = []
 
     for exp, group in calls.groupby("expiration"):
-        dte = int(group["dte"].iloc[0])
+        dte  = int(group["dte"].iloc[0])
         gran = _strike_granularity(group["strike"].tolist())
 
-        # ── Find best long leg (~80–85 delta, deep ITM) ───────────────────────
+        # ── Candidate search: delta only, NO liquidity gates ──────────────────
         long_cands: list[tuple[float, float, pd.Series]] = []
+        short_cands: list[tuple[float, float, pd.Series]] = []
+
         for _, row in group.iterrows():
             K = float(row["strike"])
             if K <= 0:
-                continue
-            if not _passes_oi_gate(row, min_oi):
-                continue
-            if not _passes_spread_gate(row, max_spread):
                 continue
             raw_iv = row.get("iv_pct")
             iv_pct = float(raw_iv) if pd.notna(raw_iv) and float(raw_iv) > 0 else None
             d = get_delta("c", current_price, K, iv_pct, dte, R)
             if ZEBRA_LONG_DELTA_LOW <= d <= ZEBRA_LONG_DELTA_HIGH:
                 long_cands.append((abs(d - ZEBRA_LONG_DELTA_TARGET), d, row.copy()))
-
-        # ── Find best short leg (~50 delta, ATM) ──────────────────────────────
-        short_cands: list[tuple[float, float, pd.Series]] = []
-        for _, row in group.iterrows():
-            K = float(row["strike"])
-            if K <= 0:
-                continue
-            if not _passes_oi_gate(row, min_oi):
-                continue
-            if not _passes_spread_gate(row, max_spread):
-                continue
-            raw_iv = row.get("iv_pct")
-            iv_pct = float(raw_iv) if pd.notna(raw_iv) and float(raw_iv) > 0 else None
-            d = get_delta("c", current_price, K, iv_pct, dte, R)
             if ZEBRA_SHORT_DELTA_LOW <= d <= ZEBRA_SHORT_DELTA_HIGH:
                 short_cands.append((abs(d - ZEBRA_SHORT_DELTA_TARGET), d, row.copy()))
 
         if not long_cands or not short_cands:
-            continue
+            continue  # no strikes in the required delta zones — hard skip
 
         long_cands.sort(key=lambda x: x[0])
         short_cands.sort(key=lambda x: x[0])
-        _, long_delta, long_row = long_cands[0]
+        _, long_delta, long_row  = long_cands[0]
         _, short_delta, short_row = short_cands[0]
 
         long_strike  = float(long_row["strike"])
         short_strike = float(short_row["strike"])
 
-        # Long must sit below ATM short (deep ITM < ATM)
         if long_strike >= short_strike:
-            continue
+            continue  # degenerate — hard skip
 
         long_mid  = _mid(long_row)
         short_mid = _mid(short_row)
+        net_debit = round(2 * long_mid - short_mid, 2)
+
+        if net_debit <= 0:
+            continue  # net credit structure — hard skip
 
         long_ext  = _extrinsic_call(long_mid, long_strike, current_price)
         short_ext = _extrinsic_call(short_mid, short_strike, current_price)
-        net_ext   = round(2 * long_ext - short_ext, 3)  # target ≈ $0
+        net_ext   = round(2 * long_ext - short_ext, 3)
 
-        if abs(net_ext) > extrinsic_tol:
-            continue  # extrinsic balance too far from zero
+        structure_delta = round(2 * long_delta - short_delta, 2)
+        capital_req     = round(net_debit * 100, 2)
+        share_cost      = round(current_price * 100, 2)
+        pct_saved       = round((share_cost - capital_req) / share_cost * 100, 1) if share_cost > 0 else 0.0
+        breakeven       = round(long_strike + net_debit, 2)
 
-        net_debit = round(2 * long_mid - short_mid, 2)
-        if net_debit <= 0:
-            continue  # net credit — degenerate structure
+        long_oi     = int(long_row.get("openInterest", 0))
+        short_oi    = int(short_row.get("openInterest", 0))
+        long_spread  = round(float(long_row.get("ask", 0)) - float(long_row.get("bid", 0)), 2)
+        short_spread = round(float(short_row.get("ask", 0)) - float(short_row.get("bid", 0)), 2)
 
-        structure_delta    = round(2 * long_delta - short_delta, 2)
-        capital_req        = round(net_debit * 100, 2)      # per 1 structure = 100 shs
-        share_cost         = round(current_price * 100, 2)
-        pct_saved          = round((share_cost - capital_req) / share_cost * 100, 1) if share_cost > 0 else 0.0
-        breakeven          = round(long_strike + net_debit, 2)
-
-        # ── Build warning tags ────────────────────────────────────────────────
+        # ── Risk warnings (IV, earnings, ex-div) — always stored ─────────────
         warnings: list[str] = []
-
         if iv_rank > ZEBRA_IV_WARN:
             warnings.append(
                 f"High IV Rank ({iv_rank:.0f}) — positive vega at risk if IV contracts post-entry"
             )
-
         exp_date = datetime.strptime(str(exp), "%Y-%m-%d").date()
-
-        if earnings_date and earnings_warn:
+        if earnings_date:
             days_earn = (earnings_date - date.today()).days
             if earnings_date <= exp_date:
                 warnings.append(
                     f"Earnings {earnings_date} ({days_earn}d) inside trade window — "
-                    "disable warning if the vol event IS your thesis"
+                    "disable if vol event is your thesis"
                 )
             elif days_earn <= 5:
-                warnings.append(
-                    f"Earnings in {days_earn}d — within 5-day proximity flag"
-                )
-
+                warnings.append(f"Earnings in {days_earn}d — within 5-day proximity flag")
         if ex_div and ex_div <= exp_date:
             warnings.append(
-                f"Ex-dividend {ex_div} before expiry — early assignment risk on deep ITM long calls"
+                f"Ex-dividend {ex_div} before expiry — early assignment risk on deep ITM longs"
             )
-
         if gran > 2.5:
             warnings.append(
-                f"${gran} strike increments in this zone — coarse grid may prevent hitting near-zero extrinsic"
+                f"${gran} strike increments — coarse grid may prevent near-zero extrinsic balance"
             )
 
         results.append({
@@ -303,16 +283,92 @@ def evaluate_zebra(
             "capital_required":   capital_req,
             "share_cost":         share_cost,
             "capital_efficiency": pct_saved,
-            "long_oi":            int(long_row.get("openInterest", 0)),
-            "short_oi":           int(short_row.get("openInterest", 0)),
-            "long_spread":        round(float(long_row.get("ask", 0)) - float(long_row.get("bid", 0)), 2),
-            "short_spread":       round(float(short_row.get("ask", 0)) - float(short_row.get("bid", 0)), 2),
+            "long_oi":            long_oi,
+            "short_oi":           short_oi,
+            "long_spread":        long_spread,
+            "short_spread":       short_spread,
             "strike_granularity": gran,
             "iv_rank":            round(iv_rank, 1),
             "warnings":           warnings,
+            "filter_status":      "",   # filled by apply_zebra_filters()
+            # stored for apply_zebra_filters earnings toggle
+            "_earnings_date":     earnings_date,
+            "_ex_div":            ex_div,
         })
 
     return sorted(results, key=lambda r: abs(r["net_extrinsic"]))
+
+
+def apply_zebra_filters(
+    results: list[dict],
+    *,
+    min_oi: int = ZEBRA_MIN_OI,
+    max_spread: float = ZEBRA_MAX_SPREAD_ABS,
+    extrinsic_tol: float = ZEBRA_EXTRINSIC_TOL,
+    earnings_warn: bool = True,
+    div_warn: bool = True,
+) -> list[dict]:
+    """
+    Stamp filter_status on every result, mirroring how add_filter_flags() works
+    in the main screener.  Does NOT remove rows — every structure remains visible
+    so the user can see exactly what it fails.
+
+    "✅ Passes all filters"  — all soft gates pass
+    "⚠️ <reason> · <reason>" — one or more gates miss, each explained precisely
+    """
+    out = []
+    for r in results:
+        issues: list[str] = []
+
+        if abs(r["net_extrinsic"]) > extrinsic_tol:
+            issues.append(
+                f"net extrinsic ${r['net_extrinsic']:+.2f}/shr "
+                f"(limit ±${extrinsic_tol:.2f})"
+            )
+        if r["long_oi"] < min_oi:
+            issues.append(f"long OI {r['long_oi']:,} < {min_oi:,} required")
+        if r["short_oi"] < min_oi:
+            issues.append(f"short OI {r['short_oi']:,} < {min_oi:,} required")
+        if r["long_spread"] > max_spread:
+            issues.append(
+                f"long spread ${r['long_spread']:.2f} > ${max_spread:.2f} limit"
+            )
+        if r["short_spread"] > max_spread:
+            issues.append(
+                f"short spread ${r['short_spread']:.2f} > ${max_spread:.2f} limit"
+            )
+
+        # Earnings proximity is a toggleable filter (user may want the vol event)
+        if earnings_warn:
+            ed = r.get("_earnings_date")
+            if ed:
+                try:
+                    exp_d = datetime.strptime(r["expiration"], "%Y-%m-%d").date()
+                    days_earn = (ed - date.today()).days
+                    if ed <= exp_d:
+                        issues.append(
+                            f"earnings {ed} ({days_earn}d) inside window"
+                        )
+                except (ValueError, TypeError):
+                    pass
+
+        # Dividend risk flag (toggleable)
+        if div_warn:
+            ex_div = r.get("_ex_div")
+            if ex_div:
+                try:
+                    exp_d = datetime.strptime(r["expiration"], "%Y-%m-%d").date()
+                    if ex_div <= exp_d:
+                        issues.append(f"ex-div {ex_div} before expiry")
+                except (ValueError, TypeError):
+                    pass
+
+        r = dict(r)  # shallow copy — don't mutate the cached list
+        r["filter_status"] = "✅ Passes all filters" if not issues else "⚠️ " + " · ".join(issues)
+        out.append(r)
+
+    # ✅ rows first, then ⚠️ — within each group keep |net_extrinsic| order
+    return sorted(out, key=lambda x: (0 if x["filter_status"].startswith("✅") else 1, abs(x["net_extrinsic"])))
 
 
 if __name__ == "__main__":
@@ -324,9 +380,9 @@ if __name__ == "__main__":
     else:
         price = float(yf.Ticker("AAPL").history(period="2d")["Close"].iloc[-1])
         print(f"AAPL @ ${price:.2f}")
-        results = evaluate_zebra("AAPL", chain, price)
+        results = apply_zebra_filters(evaluate_zebra("AAPL", chain, price))
         if not results:
-            print("No viable Zebra structures found (check OI / spread / extrinsic gates).")
+            print("No structurally valid Zebra setups found.")
         for r in results[:3]:
             print(
                 f"  Buy 2× ${r['long_strike']}C + Sell 1× ${r['short_strike']}C  "
