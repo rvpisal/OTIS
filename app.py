@@ -12,6 +12,8 @@ from zebra_screener import (
     apply_zebra_filters,
     evaluate_zebra,
     fetch_zebra_chain,
+    score_entry_confirmation,
+    get_time_decay_status,
     ZEBRA_DTE_MIN,
     ZEBRA_DTE_MAX,
     ZEBRA_MIN_OI,
@@ -142,6 +144,9 @@ def cached_zebra(ticker: str, dte_min: int, dte_max: int) -> list[dict]:
     Keyed only by ticker and DTE window — soft filter gates (OI, spread,
     extrinsic tolerance) are applied at display time via apply_zebra_filters()
     so the user can change filters without re-fetching.
+
+    Also computes entry_confirmation and time_decay per result (history already
+    fetched here, no extra network call needed).
     """
     chain = fetch_zebra_chain(ticker, dte_min=dte_min, dte_max=dte_max)
     if not chain:
@@ -153,7 +158,18 @@ def cached_zebra(ticker: str, dte_min: int, dte_max: int) -> list[dict]:
     price = float(hist["Close"].iloc[-1])
     signals = analyze_ticker(ticker, hist)
     earnings = fetch_next_earnings(ticker)
-    return evaluate_zebra(ticker, chain, price, signals=signals, earnings_date=earnings)
+    results = evaluate_zebra(ticker, chain, price, signals=signals, earnings_date=earnings)
+
+    # Entry confirmation — same for all expirations on this ticker
+    confirm = (
+        score_entry_confirmation(signals, hist, bias="bullish")
+        if signals and signals.get("macro_trend") in ("BULLISH", "BEARISH")
+        else None
+    )
+    for r in results:
+        r["entry_confirmation"] = confirm
+        r["time_decay"] = get_time_decay_status(r["current_price"], r["breakeven"], r["dte"])
+    return results
 
 
 @st.cache_data(ttl=86400, show_spinner=False)      # 1 day — one max-history fetch per ticker
@@ -459,6 +475,12 @@ def run_full_pipeline(
 
     for ticker, data in phase1_data.items():
         sigs = analyze_ticker(ticker, data["history"])
+        # Entry confirmation scored here — history already in hand, no extra fetch
+        if sigs and sigs.get("macro_trend") in ("BULLISH", "BEARISH"):
+            bias = sigs["macro_trend"].lower()
+            sigs["_entry_confirmation"] = score_entry_confirmation(
+                sigs, data["history"], bias=bias
+            )
         signals_data[ticker] = sigs
         if check_phase1_trigger(sigs):
             triggered_tickers.append(ticker)
@@ -1591,7 +1613,6 @@ def _zebra_card(r: dict) -> None:
     ext_color = "#1e7e34" if abs(r["net_extrinsic"]) <= 0.05 else "#a8d5b0" if abs(r["net_extrinsic"]) <= 0.10 else "#fff3cd"
 
     # Muted styling for rows that fail filters
-    card_style = "" if passes else "opacity:0.7"
     header_color = "#1a1a1a" if passes else "#666"
 
     warnings = r.get("warnings", [])
@@ -1678,6 +1699,137 @@ def _zebra_card(r: dict) -> None:
         # Warnings
         st.markdown(warn_html, unsafe_allow_html=True)
 
+        # ── Entry Confirmation Layer ──────────────────────────────────────────
+        confirm = r.get("entry_confirmation")
+        if confirm:
+            st.divider()
+            status      = confirm.get("status", "conflicting")
+            emoji       = confirm.get("status_emoji", "🔴")
+            score       = confirm.get("score", 0)
+            criteria    = confirm.get("criteria", {})
+
+            status_labels = {
+                "confirmed":    ("🟢 Confirmed Entry", "#c3e6cb", "#155724"),
+                "thesis_only":  ("🟡 Thesis Only",     "#fff3cd", "#856404"),
+                "conflicting":  ("🔴 Conflicting",     "#f8d7da", "#721c24"),
+            }
+            badge_text, badge_bg, badge_fg = status_labels.get(
+                status, ("— Unknown", "#e2e3e5", "#383d41")
+            )
+
+            ec1, ec2 = st.columns([3, 1])
+            ec1.markdown("**Entry Confirmation**")
+            ec2.markdown(
+                f'<span style="background:{badge_bg};color:{badge_fg};border-radius:4px;'
+                f'padding:3px 10px;font-size:0.85em;font-weight:bold">'
+                f'{badge_text} &nbsp;{score}/5</span>',
+                unsafe_allow_html=True,
+            )
+
+            CRITERIA_LABELS = {
+                "structural_break": "Structural Break",
+                "volume_confirm":   "Volume Confirm",
+                "ma_alignment":     "MA Alignment",
+                "pullback_hold":    "Pullback Hold",
+                "rsi_divergence":   "RSI Divergence",
+            }
+            pills_html = ""
+            for key, display in CRITERIA_LABELS.items():
+                c = criteria.get(key, {})
+                passed  = c.get("pass")
+                pending = c.get("pending", False)
+                label   = c.get("label", display)
+                if pending:
+                    bg, fg, symbol = "#fff3cd", "#856404", "⏳"
+                elif passed is True:
+                    bg, fg, symbol = "#c3e6cb", "#155724", "✓"
+                else:
+                    bg, fg, symbol = "#f8d7da", "#721c24", "✗"
+                pills_html += (
+                    f'<span title="{label}" style="background:{bg};color:{fg};border-radius:4px;'
+                    f'padding:3px 9px;margin:2px;font-size:0.82em;display:inline-block;cursor:help">'
+                    f'{symbol} {display}</span>'
+                )
+            st.markdown(pills_html, unsafe_allow_html=True)
+
+            # Time decay indicator
+            td = r.get("time_decay")
+            if td:
+                td_color = "#fff3cd" if td["status"] == "costly" else "#d4edda"
+                td_fg    = "#856404" if td["status"] == "costly" else "#155724"
+                st.markdown(
+                    f'<div style="background:{td_color};color:{td_fg};border-radius:4px;'
+                    f'padding:6px 10px;margin-top:6px;font-size:0.83em">'
+                    f'{td["icon"]} {td["label"]}</div>',
+                    unsafe_allow_html=True,
+                )
+
+        # ── Ratchet Pre-Trade Panel ───────────────────────────────────────────
+        # A pre-trade planning tool: given a target price, what profit does this
+        # structure generate, and where would you set a ratchet stop to lock in
+        # a portion of that gain?  No broker execution — manual GTC only.
+        key_pfx   = f"zr_{r['ticker']}_{r['expiration']}".replace("-", "_")
+        spot       = r["current_price"]
+        delta_est  = r["structure_delta"]
+        dte_val    = r["dte"]
+
+        with st.expander("📐 Ratchet Pre-Trade Planner", expanded=False):
+            dte_color = "#dc3545" if dte_val <= 21 else "#155724"
+            st.markdown(
+                f'DTE: <span style="background:{dte_color};color:#fff;border-radius:4px;'
+                f'padding:2px 8px;font-size:0.85em;font-weight:bold">{dte_val}d</span>'
+                f'{"  ⚠️ <21d — ratchet exits become urgent" if dte_val <= 21 else ""}',
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                "Plan your exit before entering. Set a target price and decide how much "
+                "estimated profit to lock in. The ratchet stop is where you'd place a "
+                "manual GTC close order — no broker automation, just a price level to monitor."
+            )
+            rp1, rp2 = st.columns(2)
+            default_target = round(spot * 1.10, 2)
+            target_price = rp1.number_input(
+                "Target price ($)",
+                min_value=round(spot * 1.01, 2),
+                max_value=round(spot * 2.00, 2),
+                value=default_target,
+                step=round(spot * 0.01, 2),
+                format="%.2f",
+                key=f"{key_pfx}_target",
+                help="The stock price where you'd fully close the position",
+            )
+            lock_in_pct = rp2.slider(
+                "Lock-in %",
+                min_value=30,
+                max_value=70,
+                value=50,
+                step=5,
+                key=f"{key_pfx}_lockin",
+                help=(
+                    "What fraction of the estimated gain to protect. "
+                    "50% = close if the stock pulls back to the midpoint between spot and target."
+                ),
+            )
+
+            move         = target_price - spot
+            est_profit   = round(delta_est * move * 100, 0)
+            lock_amt     = round(est_profit * lock_in_pct / 100, 0)
+            ratchet_stop = round(spot + (lock_in_pct / 100) * move, 2)
+
+            st.markdown(
+                f"**If {r['ticker']} reaches ${target_price:.2f}:**  \n"
+                f"Estimated structure gain ≈ **${est_profit:,.0f}** &nbsp;"
+                f"<span style='font-size:0.82em;color:#888'>"
+                f"(structure Δ {delta_est:.2f} × ${move:.2f} move × 100)</span>",
+                unsafe_allow_html=True,
+            )
+            st.success(
+                f"🎯 **Ratchet stop:** Close if **{r['ticker']} drops to ${ratchet_stop:.2f}** "
+                f"(locks in ~${lock_amt:,.0f} of estimated ${est_profit:,.0f} profit "
+                f"— {lock_in_pct}% protected). "
+                f"Place a manual GTC close order at ${ratchet_stop:.2f}."
+            )
+
 
 def _zebra_filters() -> dict:
     """Render Zebra filter controls and return the active config."""
@@ -1699,6 +1851,89 @@ def _zebra_filters() -> dict:
         "extrinsic_tol": float(extrinsic_tol),
         "earnings_warn": bool(earnings_warn), "div_warn": bool(div_warn),
     }
+
+
+def render_strategy_overview(signals_data: dict) -> None:
+    """
+    Compact per-stock grid showing which strategies triggered + Zebra entry quality.
+    Designed as a quick-scan layer before diving into the full results table or Zebra expander.
+    """
+    if not signals_data:
+        st.info("Run the screen first to see the per-stock strategy overview.")
+        return
+
+    triggered = {
+        t: s for t, s in signals_data.items()
+        if s and check_phase1_trigger(s)
+    }
+    if not triggered:
+        st.info("No tickers triggered any strategy in the last screen run.")
+        return
+
+    trend_emoji = {"BULLISH": "📈", "BEARISH": "📉", "NEUTRAL": "➡️"}
+
+    st.caption(
+        f"**{len(triggered)} tickers** triggered at least one strategy.  "
+        "**Blue** = strategy tag · **Green** = Zebra entry confirmed · "
+        "**Yellow** = Zebra thesis only (not all criteria met) · "
+        "Hover any tag to see detail."
+    )
+
+    for ticker, sigs in sorted(triggered.items()):
+        # Which strategies triggered?
+        strat_names = [
+            name for name, trigger_fn in STRATEGY_TRIGGERS.items()
+            if trigger_fn(sigs)
+        ]
+        trend   = sigs.get("macro_trend", "NEUTRAL")
+        confirm = sigs.get("_entry_confirmation")
+
+        tags_html = (
+            f'<span style="font-weight:bold;margin-right:8px">'
+            f'{trend_emoji.get(trend, "➡️")} {ticker}</span>'
+        )
+
+        # Strategy tags (blue)
+        for name in strat_names:
+            meta    = STRATEGY_META.get(name, {})
+            display = meta.get("name", name.replace("_", " ").title())
+            em      = meta.get("emoji", "")
+            tags_html += (
+                f'<span title="{display}" style="background:#cce5ff;color:#004085;'
+                f'border-radius:4px;padding:2px 7px;margin:2px;font-size:0.78em;'
+                f'display:inline-block">{em} {display}</span>'
+            )
+
+        # Zebra tag — only for bullish/bearish tickers, and only if confirmed/thesis
+        if trend in ("BULLISH", "BEARISH") and confirm:
+            z_status = confirm.get("status", "conflicting")
+            z_emoji  = confirm.get("status_emoji", "🔴")
+            z_score  = confirm.get("score", 0)
+            z_tooltip = (
+                "Entry Confirmed: 4+ of 5 criteria met"
+                if z_status == "confirmed"
+                else "Thesis Only: 3 of 5 criteria met — not all confirmations in place"
+                if z_status == "thesis_only"
+                else "Conflicting signals — fewer than 3 criteria met"
+            )
+            if z_status == "confirmed":
+                z_bg, z_fg = "#c3e6cb", "#155724"
+            elif z_status == "thesis_only":
+                z_bg, z_fg = "#fff3cd", "#856404"
+            else:
+                z_bg, z_fg = "#f8d7da", "#721c24"
+
+            if z_status != "conflicting":
+                tags_html += (
+                    f'<span title="{z_tooltip}" style="background:{z_bg};color:{z_fg};'
+                    f'border-radius:4px;padding:2px 8px;margin:2px;font-size:0.78em;'
+                    f'display:inline-block;font-weight:bold;cursor:help">'
+                    f'🦓 Zebra {z_emoji} {z_score}/5</span>'
+                )
+        elif trend == "NEUTRAL":
+            pass  # No Zebra tag for neutral tickers — Zebra requires directional bias
+
+        st.markdown(tags_html, unsafe_allow_html=True)
 
 
 def render_zebra_section(signals_data: dict) -> None:
@@ -2281,6 +2516,15 @@ def main():
             "Not limited to the Goldilocks watchlist."
         )
         render_single_ticker_section(filters)
+
+    # ── Per-stock Strategy Overview (visible after screen runs) ──────────────
+    if st.session_state.get("signals_data"):
+        st.divider()
+        with st.expander(
+            "📊 Per-Stock Strategy Overview",
+            expanded=False,
+        ):
+            render_strategy_overview(st.session_state["signals_data"])
 
     # ── Zebra screener (always available) ────────────────────────────────────
     st.divider()

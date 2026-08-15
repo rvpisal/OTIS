@@ -371,6 +371,250 @@ def apply_zebra_filters(
     return sorted(out, key=lambda x: (0 if x["filter_status"].startswith("✅") else 1, abs(x["net_extrinsic"])))
 
 
+# ── Entry confirmation scoring ────────────────────────────────────────────────
+
+def score_entry_confirmation(
+    signals: dict,
+    history_df: pd.DataFrame,
+    bias: str = "bullish",
+) -> dict:
+    """
+    Score entry quality across 5 criteria and return a summary dict.
+
+    Criteria (each worth 1 point; pullback-hold can be 0.5 if pending):
+      1. Structural level break — price ≥ 20d rolling high (bullish) / ≤ 20d low (bearish)
+      2. Volume confirmation   — latest session volume > 1.2× 20d average
+      3. MA alignment          — 20d SMA slope up AND 50d EMA slope up (bullish)
+      4. Pullback hold         — price pulled back to SMA20 and recovered (pending = 0.5)
+      5. RSI divergence        — RSI9 > 50 for bullish, or higher-low RSI divergence
+
+    Returns:
+        {
+          "status":       "confirmed" | "thesis_only" | "conflicting",
+          "status_emoji": "🟢" | "🟡" | "🔴",
+          "score":        int,        # 0–5 (rounded from 0.5 increments)
+          "score_raw":    float,
+          "criteria": {
+              "structural_break": {"pass": bool, "label": str},
+              "volume_confirm":   {"pass": bool, "label": str},
+              "ma_alignment":     {"pass": bool, "label": str},
+              "pullback_hold":    {"pass": bool | None, "label": str, "pending": bool},
+              "rsi_divergence":   {"pass": bool, "label": str},
+          }
+        }
+    """
+    try:
+        close  = history_df["Close"].dropna()
+        high   = history_df["High"].dropna()
+        low    = history_df["Low"].dropna()
+        volume = history_df["Volume"].dropna()
+
+        if len(close) < 55:
+            raise ValueError("Insufficient price history for entry scoring")
+
+        price           = float(close.iloc[-1])
+        sma20           = close.rolling(20).mean()
+        sma20_current   = float(sma20.iloc[-1])
+        sma20_5d_ago    = float(sma20.iloc[-6]) if len(sma20) > 6 else sma20_current
+
+        # ── 1. Structural level break ─────────────────────────────────────────
+        high20_5d_ago = float(high.rolling(20).max().iloc[-6])
+        low20_5d_ago  = float(low.rolling(20).min().iloc[-6])
+        if bias == "bullish":
+            struct_pass = price >= high20_5d_ago * 0.995   # 0.5% tolerance
+            struct_label = (
+                f"Price ${price:.2f} ≥ 20d high ${high20_5d_ago:.2f} — breakout confirmed ✓"
+                if struct_pass
+                else f"Price ${price:.2f} < 20d high ${high20_5d_ago:.2f} — no breakout yet"
+            )
+        else:
+            struct_pass = price <= low20_5d_ago * 1.005
+            struct_label = (
+                f"Price ${price:.2f} ≤ 20d low ${low20_5d_ago:.2f} — breakdown confirmed ✓"
+                if struct_pass
+                else f"Price ${price:.2f} > 20d low ${low20_5d_ago:.2f} — no breakdown yet"
+            )
+
+        # ── 2. Volume confirmation ─────────────────────────────────────────────
+        avg_vol20 = float(volume.rolling(20).mean().iloc[-1])
+        last_vol  = float(volume.iloc[-1])
+        vol_ratio = last_vol / avg_vol20 if avg_vol20 > 0 else 0.0
+        vol_pass  = vol_ratio >= 1.2
+        vol_label = (
+            f"Volume {vol_ratio:.1f}× 20d avg — confirmation present ✓"
+            if vol_pass
+            else f"Volume {vol_ratio:.1f}× 20d avg (< 1.2× needed)"
+        )
+
+        # ── 3. MA alignment ───────────────────────────────────────────────────
+        sma20_slope_up = sma20_current > sma20_5d_ago
+        ema50_series   = close.ewm(span=50, adjust=False).mean()
+        ema50_current  = float(ema50_series.iloc[-1])
+        ema50_5d_ago   = float(ema50_series.iloc[-6])
+        ema50_slope_up = ema50_current > ema50_5d_ago
+
+        if bias == "bullish":
+            ma_pass  = sma20_slope_up and ema50_slope_up
+        else:
+            ma_pass  = (not sma20_slope_up) and (not ema50_slope_up)
+        ma_label = (
+            f"SMA20 {'▲' if sma20_slope_up else '▼'} · EMA50 {'▲' if ema50_slope_up else '▼'} "
+            f"({'aligned ✓' if ma_pass else f'not aligned for {bias}'})"
+        )
+
+        # ── 4. Pullback hold ──────────────────────────────────────────────────
+        recent_low3  = float(low.iloc[-3:].min())
+        recent_high3 = float(high.iloc[-3:].max())
+        pb_pending   = False
+
+        if bias == "bullish":
+            touched_sma = recent_low3 <= sma20_current * 1.02
+            back_above  = price >= sma20_current
+            if touched_sma and back_above:
+                pb_pass  = True
+                pb_label = f"Pulled back to SMA20 ${sma20_current:.2f} and recovered ✓"
+            elif back_above:
+                pb_pass    = None   # no pullback yet — holding above
+                pb_pending = True
+                pb_label   = f"Holding above SMA20 ${sma20_current:.2f} — no pullback yet (pending)"
+            else:
+                pb_pass  = False
+                pb_label = f"Price ${price:.2f} below SMA20 ${sma20_current:.2f}"
+        else:
+            touched_sma = recent_high3 >= sma20_current * 0.98
+            back_below  = price <= sma20_current
+            if touched_sma and back_below:
+                pb_pass  = True
+                pb_label = f"Bounced to SMA20 ${sma20_current:.2f} and rejected ✓"
+            elif back_below:
+                pb_pass    = None
+                pb_pending = True
+                pb_label   = f"Holding below SMA20 ${sma20_current:.2f} — no bounce yet (pending)"
+            else:
+                pb_pass  = False
+                pb_label = f"Price ${price:.2f} above SMA20 ${sma20_current:.2f}"
+
+        # ── 5. RSI divergence ─────────────────────────────────────────────────
+        rsi9        = float(signals.get("rsi9") or 50)
+        delta_s     = close.diff()
+        gain        = delta_s.clip(lower=0).rolling(9).mean()
+        loss        = (-delta_s.clip(upper=0)).rolling(9).mean()
+        rs          = gain / loss.replace(0, np.nan)
+        rsi_series  = 100 - (100 / (1 + rs))
+        rsi_5d_ago  = float(rsi_series.iloc[-6]) if len(rsi_series) > 6 else rsi9
+        price_5d_ago = float(close.iloc[-6]) if len(close) > 6 else price
+
+        if bias == "bullish":
+            if rsi9 > 50:
+                rsi_pass  = True
+                rsi_label = f"RSI9 {rsi9:.0f} > 50 — momentum confirms bullish ✓"
+            elif price < price_5d_ago and rsi9 > rsi_5d_ago:
+                rsi_pass  = True
+                rsi_label = (
+                    f"RSI9 {rsi9:.0f} vs {rsi_5d_ago:.0f} (rising while price pulled back) "
+                    "— bullish divergence ✓"
+                )
+            else:
+                rsi_pass  = False
+                rsi_label = f"RSI9 {rsi9:.0f} < 50 and no divergence detected"
+        else:
+            if rsi9 < 50:
+                rsi_pass  = True
+                rsi_label = f"RSI9 {rsi9:.0f} < 50 — momentum confirms bearish ✓"
+            elif price > price_5d_ago and rsi9 < rsi_5d_ago:
+                rsi_pass  = True
+                rsi_label = (
+                    f"RSI9 {rsi9:.0f} vs {rsi_5d_ago:.0f} (falling while price bounced) "
+                    "— bearish divergence ✓"
+                )
+            else:
+                rsi_pass  = False
+                rsi_label = f"RSI9 {rsi9:.0f} > 50 and no divergence detected"
+
+        # ── Score & overall status ────────────────────────────────────────────
+        score_raw = (
+            (1.0 if struct_pass else 0.0)
+            + (1.0 if vol_pass else 0.0)
+            + (1.0 if ma_pass else 0.0)
+            + (0.5 if pb_pass is None else (1.0 if pb_pass else 0.0))
+            + (1.0 if rsi_pass else 0.0)
+        )
+        score = int(round(score_raw))
+
+        if score >= 4:
+            status = "confirmed"
+            emoji  = "🟢"
+        elif score >= 3:
+            status = "thesis_only"
+            emoji  = "🟡"
+        else:
+            status = "conflicting"
+            emoji  = "🔴"
+
+        return {
+            "status":       status,
+            "status_emoji": emoji,
+            "score":        score,
+            "score_raw":    score_raw,
+            "criteria": {
+                "structural_break": {"pass": struct_pass, "label": struct_label},
+                "volume_confirm":   {"pass": vol_pass,    "label": vol_label},
+                "ma_alignment":     {"pass": ma_pass,     "label": ma_label},
+                "pullback_hold":    {"pass": pb_pass,     "label": pb_label,  "pending": pb_pending},
+                "rsi_divergence":   {"pass": rsi_pass,    "label": rsi_label},
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"score_entry_confirmation failed: {e}")
+        return {
+            "status":       "conflicting",
+            "status_emoji": "🔴",
+            "score":        0,
+            "score_raw":    0.0,
+            "criteria":     {},
+        }
+
+
+def get_time_decay_status(
+    current_price: float,
+    breakeven: float,
+    dte: int,
+) -> dict:
+    """
+    Diagnose whether flat price is costing theta on this Zebra position.
+
+    The Zebra is NOT theta-neutral: the short ATM call decays fastest.
+    When price is flat near breakeven the short leg's theta erodes value
+    without the long legs gaining intrinsic fast enough — unlike actual stock.
+
+    Returns: {"status": "costly" | "fine", "icon": str, "label": str}
+    """
+    gap_pct = (current_price - breakeven) / breakeven if breakeven > 0 else 0.0
+
+    if dte > 21 and gap_pct < 0.05:          # within 5% of breakeven with time left
+        return {
+            "status": "costly",
+            "icon":   "⚠️",
+            "label": (
+                f"Flat price is costing you time value — spot ${current_price:.2f} is within 5% "
+                f"of breakeven ${breakeven:.2f} with {dte}d remaining. "
+                "Structure needs upward movement to behave like stock."
+            ),
+        }
+    direction = "above" if gap_pct >= 0 else "below"
+    note = " Watch theta as DTE decreases." if 0 <= gap_pct < 0.10 and dte > 21 else ""
+    return {
+        "status": "fine",
+        "icon":   "✓",
+        "label": (
+            f"Position behaving close to stock-equivalent — "
+            f"spot ${current_price:.2f} is {abs(gap_pct)*100:.1f}% {direction} "
+            f"breakeven ${breakeven:.2f}.{note}"
+        ),
+    }
+
+
 if __name__ == "__main__":
     import time
     print("Fetching AAPL Zebra chain (60–120 DTE)…")
