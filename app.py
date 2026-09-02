@@ -20,6 +20,14 @@ from zebra_screener import (
     ZEBRA_MAX_SPREAD_ABS,
     ZEBRA_EXTRINSIC_TOL,
 )
+from earnings_playbook import (
+    fetch_earnings_history,
+    fetch_all_earnings_data,
+    score_direction_bias,
+    compute_implied_move,
+    recommend_earnings_strategy,
+    backtest_earnings_plays,
+)
 from data_fetcher import DataFetcher, TICKER_UNIVERSE
 from indicators import analyze_ticker, check_phase1_trigger, STRATEGY_TRIGGERS
 from news_events import (
@@ -179,6 +187,49 @@ def cached_backtest(ticker: str) -> dict | None:
     if df is None or df.empty:
         return None
     return backtest_ticker(df)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)       # 1 h — analyst data refreshes intraday
+def cached_earnings_analysis(ticker: str) -> dict:
+    """
+    Batch-fetch all earnings data for one ticker in a single Ticker() call.
+    Returns a dict with keys: history_df, analyst_data, backtest_stats,
+    direction_score, next_earnings, implied_move, is_etf.
+    """
+    import yfinance as _yf
+    hist = _yf.Ticker(ticker).history(period="3y")
+    price = float(hist["Close"].iloc[-1]) if (hist is not None and not hist.empty) else None
+
+    analyst_data = fetch_all_earnings_data(ticker, hist)
+    history_df   = fetch_earnings_history(ticker, hist)
+    bt_stats     = backtest_earnings_plays(history_df)
+    next_earn    = fetch_next_earnings(ticker)
+
+    # Signals — use a 2y slice to match the screener's behaviour
+    signals = None
+    if hist is not None and not hist.empty:
+        signals = analyze_ticker(ticker, hist.tail(504))   # ~2y of trading days
+
+    bias = score_direction_bias(
+        ticker, history_df, signals,
+        calendar_data=analyst_data.get("calendar"),
+        analyst_data=analyst_data,
+    )
+    implied = compute_implied_move(ticker, next_earn, spot=price)
+
+    return {
+        "ticker":         ticker,
+        "spot":           price,
+        "history_df":     history_df,
+        "analyst_data":   analyst_data,
+        "backtest_stats": bt_stats,
+        "direction_score": bias,
+        "next_earnings":  next_earn,
+        "implied_move":   implied,
+        "signals":        signals,
+        "is_etf":         analyst_data.get("is_etf", False),
+    }
+
 
 # ── Help text strings (centralised so they're easy to update) ─────────────────
 
@@ -1602,6 +1653,370 @@ def render_news_section():
                 st.caption("Sources: Yahoo Finance & CNBC RSS · refreshes every 15 minutes.")
 
 
+# ── Earnings Playbook ─────────────────────────────────────────────────────────
+
+def _ep_score_bar(score: int) -> str:
+    """Return an HTML horizontal score bar for –100…+100."""
+    pct   = (score + 100) / 200 * 100         # map –100…+100 → 0…100%
+    color = "#1e7e34" if score > 35 else "#dc3545" if score < -35 else "#856404"
+    label_pos = "right" if score < 0 else "left"
+    return (
+        f'<div style="position:relative;background:#e9ecef;border-radius:6px;height:18px;margin:4px 0">'
+        f'<div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:#adb5bd"></div>'
+        f'<div style="position:absolute;left:{min(50,pct):.1f}%;width:{abs(pct-50):.1f}%;'
+        f'top:2px;bottom:2px;background:{color};border-radius:4px"></div>'
+        f'<span style="position:absolute;{label_pos}:4px;top:0;line-height:18px;'
+        f'font-size:0.75em;font-weight:bold;color:{color}">{score:+d}</span>'
+        f'</div>'
+    )
+
+
+def _ep_criterion_pill(key: str, data: dict) -> str:
+    avail   = data.get("available", False)
+    score_v = data.get("score", 0)
+    label   = data.get("label", key)
+    names   = {
+        "eps_beat_streak":    "Beat Streak",
+        "surprise_trend":     "Surprise Trend",
+        "estimate_revisions": "Est. Revisions",
+        "momentum":           "Pre-Earnings Momentum",
+        "analyst_consensus":  "Analyst Consensus",
+    }
+    display = names.get(key, key.replace("_", " ").title())
+    if not avail:
+        bg, fg, sym = "#e9ecef", "#6c757d", "—"
+    elif score_v > 0:
+        bg, fg, sym = "#c3e6cb", "#155724", "▲"
+    elif score_v < 0:
+        bg, fg, sym = "#f8d7da", "#721c24", "▼"
+    else:
+        bg, fg, sym = "#fff3cd", "#856404", "~"
+    return (
+        f'<span title="{label}" style="background:{bg};color:{fg};border-radius:4px;'
+        f'padding:3px 8px;margin:2px;font-size:0.8em;display:inline-block;cursor:help">'
+        f'{sym} {display}</span>'
+    )
+
+
+def render_earnings_playbook() -> None:
+    """
+    📅 Earnings Playbook — full per-ticker earnings analysis module.
+    Three-stage guidance: Scan (5-10d out) → Enter (1-3d before) → Announcement day.
+    """
+    st.caption(
+        "Analyse a stock's historical earnings reactions, score directional bias from 5 signals, "
+        "compute the market's implied move, and get strategy recommendations for the upcoming event.  \n"
+        "⚠️ **Confidence note:** Direction accuracy is ~50–63% even in high-conviction setups. "
+        "The primary value is **strategy type selection** (credit vs. debit) based on IV rank, "
+        "not direction prediction."
+    )
+
+    # ── Ticker input ──────────────────────────────────────────────────────────
+    ep_col1, ep_col2 = st.columns([3, 1])
+    ep_ticker = ep_col1.text_input(
+        "Ticker", placeholder="e.g. AAPL, NVDA, MSFT …",
+        label_visibility="collapsed", key="ep_ticker_input",
+    ).strip().upper()
+    ep_run = ep_col2.button("📅 Analyse Earnings", type="primary",
+                            use_container_width=True, key="ep_run_btn")
+
+    if ep_run and ep_ticker:
+        with st.spinner(f"Fetching earnings data for **{ep_ticker}**…"):
+            analysis = cached_earnings_analysis(ep_ticker)
+        st.session_state["ep_result"] = (ep_ticker, analysis)
+
+    analysis_tuple = st.session_state.get("ep_result")
+    if not analysis_tuple:
+        st.info("Enter a ticker above and click **📅 Analyse Earnings** to begin.")
+        return
+
+    shown_ticker, data = analysis_tuple
+
+    # Guard: ETF
+    if data.get("is_etf"):
+        st.warning(
+            f"**{shown_ticker}** does not report quarterly earnings (ETF or fund). "
+            "Earnings Playbook requires an individual equity."
+        )
+        return
+
+    history_df    = data.get("history_df", pd.DataFrame())
+    direction     = data.get("direction_score", {})
+    implied       = data.get("implied_move", {})
+    bt_stats      = data.get("backtest_stats", {})
+    next_earn     = data.get("next_earnings")
+    spot          = data.get("spot") or 0.0
+    analyst_data  = data.get("analyst_data", {})
+    signals       = data.get("signals", {}) or {}
+    iv_rank       = float((signals or {}).get("iv_rank", 50) or 50)
+
+    # ── Panel 1: Earnings overview ────────────────────────────────────────────
+    st.subheader(f"📅 {shown_ticker} — Earnings Playbook")
+
+    days_to_earn = None
+    if next_earn:
+        days_to_earn = (next_earn - date.today()).days
+
+    earn_label = (
+        f"{next_earn} ({days_to_earn}d away)"
+        if next_earn and days_to_earn is not None and days_to_earn >= 0
+        else "Not scheduled / past"
+    )
+
+    o1, o2, o3, o4, o5 = st.columns(5)
+    o1.metric("Next Earnings", earn_label if next_earn else "—",
+              help="Next scheduled earnings announcement date")
+
+    # Consensus EPS from calendar
+    cal = analyst_data.get("calendar") or {}
+    eps_avg = cal.get("Earnings Average") or cal.get("earningsAverage")
+    o2.metric("Consensus EPS", f"${float(eps_avg):.2f}" if eps_avg else "—",
+              help="Analyst consensus EPS estimate for the upcoming quarter")
+
+    # Beat rate
+    n_events = bt_stats.get("n_events", 0)
+    beat_rate = bt_stats.get("beat_rate")
+    o3.metric(
+        "Beat Rate",
+        f"{beat_rate:.0f}%" if beat_rate is not None else "—",
+        help=f"% of last {n_events} quarters with a positive EPS surprise",
+    )
+
+    # Analyst buy %
+    rec_summary = analyst_data.get("recommendations_summary")
+    buy_count = hold_count = sell_count = 0
+    if rec_summary is not None and not (isinstance(rec_summary, pd.DataFrame) and rec_summary.empty):
+        try:
+            row = rec_summary.iloc[0]
+            buy_count  = int(row.get("strongBuy", 0) + row.get("buy", 0))
+            hold_count = int(row.get("hold", 0))
+            sell_count = int(row.get("sell", 0) + row.get("strongSell", 0))
+        except Exception:
+            pass
+    total_ana = buy_count + hold_count + sell_count
+    o4.metric(
+        "Analyst Ratings",
+        f"{buy_count}B · {hold_count}H · {sell_count}S" if total_ana > 0 else "—",
+        help="Current analyst ratings: Buy · Hold · Sell",
+    )
+
+    # Price target upside
+    pt = analyst_data.get("price_targets") or {}
+    mean_target = pt.get("mean") or pt.get("targetMeanPrice")
+    if mean_target and spot > 0:
+        upside = (float(mean_target) - spot) / spot * 100
+        o5.metric("PT Upside", f"{upside:+.1f}%",
+                  help=f"Mean analyst price target ${float(mean_target):.2f} vs. current ${spot:.2f}")
+    else:
+        o5.metric("Price Target", "—", help="Analyst mean price target not available")
+
+    # Days-to-earnings urgency banner
+    if days_to_earn is not None:
+        if days_to_earn <= 1:
+            st.error("🚨 **Earnings are today or tomorrow** — announcement-day guidance applies. Review the strategy recommendations carefully.")
+        elif days_to_earn <= 3:
+            st.warning(f"⚡ **{days_to_earn} days to earnings** — Enter window is open. Refer to the strategy recommendations below.")
+        elif days_to_earn <= 10:
+            st.info(f"🔍 **{days_to_earn} days to earnings** — Scan window. Analyse and build your plan now.")
+
+    st.divider()
+
+    # ── Panel 2: Historical Reaction Table ────────────────────────────────────
+    st.markdown("**Historical Earnings Reactions**")
+    if history_df.empty:
+        st.info("No historical EPS data available for this ticker.")
+    else:
+        display_cols = ["eps_estimate", "eps_actual", "surprise_pct", "move_1d_pct", "move_5d_pct"]
+        col_labels   = {
+            "eps_estimate": "EPS Est.",
+            "eps_actual":   "Reported",
+            "surprise_pct": "Surprise %",
+            "move_1d_pct":  "1-Day Move %",
+            "move_5d_pct":  "5-Day Drift %",
+        }
+        disp_df = history_df[[c for c in display_cols if c in history_df.columns]].copy()
+        disp_df.index = [str(d) for d in disp_df.index]
+        disp_df = disp_df.rename(columns=col_labels)
+
+        def _color_cell(val):
+            if not isinstance(val, (int, float)):
+                return ""
+            if val > 0:
+                return "color:#155724"
+            if val < 0:
+                return "color:#721c24"
+            return ""
+
+        styled = disp_df.style.applymap(
+            _color_cell, subset=[c for c in col_labels.values() if c in disp_df.columns]
+        ).format(
+            {c: "{:.2f}" for c in disp_df.columns if c in col_labels.values()},
+            na_rep="—"
+        )
+        st.dataframe(styled, use_container_width=True)
+
+        # Summary stats row
+        if n_events > 0:
+            s1, s2, s3, s4 = st.columns(4)
+            up_rate = bt_stats.get("up_reaction_rate")
+            sell_news = bt_stats.get("sell_the_news_rate")
+            med_move  = bt_stats.get("median_abs_move")
+            avg_up    = bt_stats.get("avg_up_move")
+            avg_dn    = bt_stats.get("avg_down_move")
+            s1.metric("Up Reaction Rate",  f"{up_rate:.0f}%" if up_rate is not None else "—",
+                      help="% of earnings events where stock rose the next day")
+            s2.metric("Sell-the-News Rate", f"{sell_news:.0f}%" if sell_news is not None else "—",
+                      help="% of EPS beats where the stock FELL the day after (sell the news)")
+            s3.metric("Median Abs. Move",  f"±{med_move:.1f}%" if med_move is not None else "—",
+                      help="Typical 1-day move magnitude (up or down) after earnings")
+            avg_drift = bt_stats.get("avg_move_5d_up")
+            s4.metric("5-Day Drift (up days)", f"{avg_drift:+.1f}%" if avg_drift is not None else "—",
+                      help="Average 5-day return after earnings on days the stock initially rose")
+
+    st.divider()
+
+    # ── Panel 3: Direction Score ──────────────────────────────────────────────
+    score         = direction.get("score", 0)
+    dir_label     = direction.get("direction_label", "🟡 No Clear Edge")
+    conf_label    = direction.get("confidence", "low")
+    conf_pct      = direction.get("confidence_pct", "~50–55%")
+    sigs_used     = direction.get("signals_used", 0)
+    breakdown_d   = direction.get("breakdown", {})
+
+    ds1, ds2 = st.columns([3, 1])
+    ds1.markdown("**Direction Bias Score**")
+    ds2.markdown(
+        f'<span style="font-size:1.1em;font-weight:bold">{dir_label}</span>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(_ep_score_bar(score), unsafe_allow_html=True)
+    st.caption(
+        f"Based on **{sigs_used}/5 signals** with available data. "
+        f"Confidence: **{conf_label}** — accuracy {conf_pct} at best. "
+        "Use for strategy type selection, not as a directional oracle."
+    )
+
+    pills_html = "".join(_ep_criterion_pill(k, v) for k, v in breakdown_d.items())
+    st.markdown(pills_html, unsafe_allow_html=True)
+
+    # Expand details
+    with st.expander("🔍 Score breakdown detail", expanded=False):
+        for key, val in breakdown_d.items():
+            icon = "✓" if val.get("available") and val.get("score", 0) > 0 else \
+                   "✗" if val.get("available") and val.get("score", 0) < 0 else \
+                   "~" if val.get("available") else "—"
+            names = {
+                "eps_beat_streak": "EPS Beat Streak",
+                "surprise_trend": "Surprise Trend",
+                "estimate_revisions": "Estimate Revisions",
+                "momentum": "Pre-Earnings Momentum",
+                "analyst_consensus": "Analyst Consensus",
+            }
+            st.caption(
+                f"{icon} **{names.get(key, key)}** ({val.get('score', 0):+d} pts): "
+                f"{val.get('label', '—')}"
+            )
+
+    st.divider()
+
+    # ── Panel 4: Implied Move ─────────────────────────────────────────────────
+    st.markdown("**Market-Implied Move (from ATM Straddle)**")
+    imp_pct  = implied.get("implied_move_pct")
+    imp_up   = implied.get("implied_up_target")
+    imp_dn   = implied.get("implied_down_target")
+    imp_exp  = implied.get("expiration_used", "—")
+    imp_note = implied.get("note", "—")
+    imp_cost = implied.get("straddle_cost")
+
+    if imp_pct:
+        im1, im2, im3, im4 = st.columns(4)
+        im1.metric("Implied Move", f"±{imp_pct*100:.1f}%",
+                   help="ATM straddle cost ÷ spot price — the market's breakeven move")
+        im2.metric("Up Target",    f"${imp_up:,.2f}" if imp_up else "—",
+                   help="Spot + implied move")
+        im3.metric("Down Target",  f"${imp_dn:,.2f}" if imp_dn else "—",
+                   help="Spot − implied move")
+        im4.metric("Straddle Cost", f"${imp_cost:.2f}/shr" if imp_cost else "—",
+                   help="Combined ATM call + put mid price")
+        st.caption(f"📋 {imp_note}")
+
+        # Compare implied vs. historical median
+        med = bt_stats.get("median_abs_move")
+        if med is not None and imp_pct is not None:
+            hist_pct = med / 100
+            ratio    = hist_pct / imp_pct if imp_pct > 0 else 1
+            if ratio > 1.15:
+                st.info(
+                    f"📈 **Vol appears underpriced** — historical median move ({med:.1f}%) is "
+                    f"{ratio:.1f}× the implied ({imp_pct*100:.1f}%). "
+                    "A long straddle / strangle may be worth considering."
+                )
+            elif ratio < 0.85:
+                st.info(
+                    f"📉 **Vol appears overpriced** — historical median move ({med:.1f}%) is only "
+                    f"{ratio:.1f}× the implied ({imp_pct*100:.1f}%). "
+                    "Selling premium (credit spread / condor) is favoured."
+                )
+            else:
+                st.caption(
+                    f"Historical median move {med:.1f}% ≈ implied {imp_pct*100:.1f}% — vol is fairly priced."
+                )
+    else:
+        st.warning(f"Could not compute implied move: {implied.get('note', 'unavailable')}")
+
+    st.divider()
+
+    # ── Panel 5: Strategy Recommendations ────────────────────────────────────
+    st.markdown("**Strategy Recommendations for Earnings**")
+    st.caption(
+        "Ranked by fit for the current IV + direction combination. "
+        "Each includes a **three-stage timing guide**: when to scan, when to enter, and what to do on announcement day."
+    )
+
+    direction_str = direction.get("direction", "neutral")
+    recs = recommend_earnings_strategy(
+        direction=direction_str,
+        iv_rank=iv_rank,
+        implied_move_pct=imp_pct,
+        spot=spot,
+    )
+
+    IV_FIT_COLORS = {"ideal": "#c3e6cb", "acceptable": "#fff3cd", "suboptimal": "#f8d7da"}
+
+    for rec in recs:
+        iv_fit_bg = IV_FIT_COLORS.get(rec.get("iv_fit", "acceptable"), "#f0f0f0")
+        with st.container(border=True):
+            rc1, rc2, rc3 = st.columns([3, 2, 1])
+            rc1.markdown(f"**#{rec['rank']} — {rec['name']}**")
+            rc2.caption(f"Risk: **{rec['risk_profile'].title()}**")
+            rc3.markdown(
+                f'<span style="background:{iv_fit_bg};border-radius:4px;padding:2px 7px;'
+                f'font-size:0.8em">IV fit: {rec["iv_fit"]}</span>',
+                unsafe_allow_html=True,
+            )
+            st.caption(f"*Structure:* {rec['structure']}")
+            st.markdown(rec["rationale"])
+            st.caption(f"⚡ **Max loss:** {rec['max_loss_note']}")
+
+            if rec.get("caution"):
+                st.warning(rec["caution"], icon="⚠️")
+
+            # Three-stage timeline
+            tl = rec.get("timeline", {})
+            if tl:
+                with st.expander("📅 Three-Stage Timing Guide", expanded=False):
+                    t1, t2, t3 = st.columns(3)
+                    t1.success(f"**🔍 Scan (5–10d out)**\n\n{tl.get('scan', '—')}")
+                    t2.info(f"**📥 Enter (1–3d before)**\n\n{tl.get('enter', '—')}")
+                    t3.warning(f"**📢 Announcement Day**\n\n{tl.get('announcement', '—')}")
+
+    st.caption(
+        "⚠️ **These are educational frameworks, not advice.** "
+        "Earnings are binary events — even high-conviction setups fail frequently. "
+        "Limit earnings position sizes to ≤2% of portfolio and use defined-risk structures."
+    )
+
+
 # ── Zebra — Stock Replacement Screener ───────────────────────────────────────
 
 def _zebra_card(r: dict) -> None:
@@ -2516,6 +2931,14 @@ def main():
             "Not limited to the Goldilocks watchlist."
         )
         render_single_ticker_section(filters)
+
+    # ── Earnings Playbook (always available) ─────────────────────────────────
+    st.divider()
+    with st.expander(
+        "📅 Earnings Playbook — Pre-Earnings Analysis & Strategy Selection",
+        expanded=bool(st.session_state.get("ep_result")),
+    ):
+        render_earnings_playbook()
 
     # ── Per-stock Strategy Overview (visible after screen runs) ──────────────
     if st.session_state.get("signals_data"):
