@@ -962,6 +962,10 @@ def format_legs(row: pd.Series) -> str:
         return f"Buy {_fmt_k(ls)}C + Buy {_fmt_k(ls)}P · {exp} ({dte}d)"
     if s == "LONG_STRANGLE":
         return f"Buy {_fmt_k(ss)}P + Buy {_fmt_k(ls)}C · {exp} ({dte}d)"
+    if s == "CALL_RATIO_BACKSPREAD":
+        return f"Sell 1× {_fmt_k(ss)}C + Buy 2× {_fmt_k(ls)}C · {exp} ({dte}d)"
+    if s == "PUT_RATIO_BACKSPREAD":
+        return f"Sell 1× {_fmt_k(ss)}P + Buy 2× {_fmt_k(ls)}P · {exp} ({dte}d)"
     return ""
 
 
@@ -1407,6 +1411,24 @@ _STRATEGY_INFO = {
         "Cheaper than a straddle, but needs a bigger move to pay off (debit capped at 8% of spot). "
         "The two strikes shown are the put (lower) and call (upper) — both legs are LONG. "
         "**Triggered by:** IV Rank < 25 · neutral RSI(9) 40–60 · price coiled inside the bands."
+    ),
+    "CALL_RATIO_BACKSPREAD": (
+        "🚀⬆️ **Call Ratio Backspread (1×2)** — Sell 1 ATM call (delta ~0.50), buy 2 OTM calls "
+        "(delta ~0.30–0.40) at the same expiry. Usually entered for a small credit or near-zero cost. "
+        "**Profit** from a large upside move (unlimited above the upper breakeven) OR if the stock "
+        "drops below both strikes (net credit kept). "
+        "**Danger zone:** stock pins near the long strike at expiry — that's where max loss occurs. "
+        "**Best in low IV** — benefits from IV expansion (positive net vega); IV crush hurts. "
+        "**Triggered by:** BULLISH trend · RSI(9) < 65 · IV Rank < 55."
+    ),
+    "PUT_RATIO_BACKSPREAD": (
+        "📉⬇️ **Put Ratio Backspread (1×2)** — Sell 1 ATM put (delta ~0.50), buy 2 OTM puts "
+        "(delta ~0.30–0.40) at the same expiry. Usually entered for a small credit or near-zero cost. "
+        "**Profit** from a large downside move (unlimited below the lower breakeven) OR if the stock "
+        "rallies above both strikes (net credit kept). "
+        "**Danger zone:** stock pins near the long strike at expiry — that's where max loss occurs. "
+        "**Best in low IV** — benefits from IV expansion (positive net vega); IV crush hurts. "
+        "**Triggered by:** BEARISH trend · RSI(9) > 35 · IV Rank < 55."
     ),
 }
 
@@ -2042,6 +2064,295 @@ def render_earnings_playbook() -> None:
         "Earnings are binary events — even high-conviction setups fail frequently. "
         "Limit earnings position sizes to ≤2% of portfolio and use defined-risk structures."
     )
+
+
+# ── Ratio Backspreads ─────────────────────────────────────────────────────────
+
+def _backspread_pnl_table(row: pd.Series) -> pd.DataFrame:
+    """Compute terminal P&L at 8 price scenarios for a 1×2 backspread."""
+    import numpy as np
+    s = str(row.get("strategy", ""))
+    S = float(row.get("current_price", 100))
+    short_strike = float(row.get("short_strike", S))
+    long_strike = float(row.get("long_strike", S))
+    net_credit = float(row.get("net_credit", 0))
+
+    scenarios = [S * m for m in (0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15, 1.20)]
+    rows = []
+    for price in scenarios:
+        pct = (price / S - 1) * 100
+        if s == "CALL_RATIO_BACKSPREAD":
+            short_pnl = -max(0.0, price - short_strike)
+            long_pnl = 2 * max(0.0, price - long_strike)
+        else:  # PUT_RATIO_BACKSPREAD
+            short_pnl = -max(0.0, short_strike - price)
+            long_pnl = 2 * max(0.0, long_strike - price)
+        net_per_share = short_pnl + long_pnl + net_credit
+        net_dollar = round(net_per_share * 100, 0)
+
+        danger = False
+        if s == "CALL_RATIO_BACKSPREAD":
+            danger = short_strike <= price <= long_strike
+        else:
+            danger = long_strike <= price <= short_strike
+
+        rows.append({
+            "Price": f"${price:,.2f}",
+            "Move": f"{pct:+.0f}%",
+            "P&L": f"${net_dollar:+,.0f}",
+            "⚠️": "⚠️ Danger" if danger else "",
+        })
+    return pd.DataFrame(rows)
+
+
+def _backspread_card(row: pd.Series) -> None:
+    """Render one Ratio Backspread detail card."""
+    s = str(row.get("strategy", ""))
+    is_call = s == "CALL_RATIO_BACKSPREAD"
+    ticker = str(row.get("ticker", ""))
+    S = float(row.get("current_price", 0))
+    short_strike = float(row.get("short_strike", 0))
+    long_strike = float(row.get("long_strike", 0))
+    dte = int(row.get("dte", 0))
+    expiration = str(row.get("expiration", ""))
+    net_credit = float(row.get("net_credit", 0))
+    spread_width = float(row.get("spread_width", 0))
+    max_loss = float(row.get("max_loss", 0))
+    iv_rank = float(row.get("iv_rank", 0))
+    iv_quality = str(row.get("iv_quality", "🟡"))
+    net_delta = row.get("net_delta", None)
+    net_gamma = row.get("net_gamma", None)
+    net_theta_daily = row.get("net_theta_daily", None)
+    net_vega_per_pct = row.get("net_vega_per_pct", None)
+    short_mid = float(row.get("short_mid", 0))
+    long_mid = float(row.get("long_mid", 0))
+    upper_be = row.get("upper_breakeven", None)
+    lower_be = row.get("lower_breakeven", None)
+    breakeven = upper_be if is_call else lower_be
+    direction = "Call" if is_call else "Put"
+
+    with st.container(border=True):
+        # ── Header ────────────────────────────────────────────────────────────
+        col_h1, col_h2 = st.columns([3, 1])
+        with col_h1:
+            emoji = "🚀⬆️" if is_call else "📉⬇️"
+            st.markdown(f"### {emoji} **{ticker}** — {direction} Ratio Backspread (1×2)")
+            st.caption(f"Current price: **${S:,.2f}** · DTE: **{dte}d** · Expiry: {expiration}")
+        with col_h2:
+            trend = str(row.get("macro_trend", ""))
+            trend_color = "#28a745" if trend == "BULLISH" else "#dc3545" if trend == "BEARISH" else "#6c757d"
+            st.markdown(
+                f'<div style="text-align:right; color:{trend_color}; font-size:1.1em; font-weight:bold;">'
+                f'{trend}</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div style="text-align:right; color:#999; font-size:0.85em;">'
+                f'RSI(9): {row.get("rsi9", 0):.1f} · IV Rank: {iv_rank:.0f}%</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── Setup ─────────────────────────────────────────────────────────────
+        st.markdown("**Setup**")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric(
+                f"Sell 1× ${short_strike:,.0f} {direction}",
+                f"${short_mid:.2f} mid",
+                help=f"Bid: ${row.get('short_bid', 0):.2f} / Ask: ${row.get('short_ask', 0):.2f}  ·  OI: {int(row.get('short_oi', 0)):,}",
+            )
+        with c2:
+            st.metric(
+                f"Buy 2× ${long_strike:,.0f} {direction}",
+                f"${long_mid:.2f} mid",
+                help=f"Bid: ${row.get('long_bid', 0):.2f} / Ask: ${row.get('long_ask', 0):.2f}  ·  OI: {int(row.get('long_oi', 0)):,}",
+            )
+        with c3:
+            if net_credit >= 0:
+                st.metric("Net Credit", f"${net_credit:.2f}", delta="Positive carry", delta_color="normal")
+            else:
+                st.metric("Net Debit", f"${-net_credit:.2f}", delta="Cost to enter", delta_color="inverse")
+
+        c4, c5 = st.columns(2)
+        with c4:
+            st.metric("Max Loss", f"${abs(max_loss):,.0f}", help=f"Occurs if stock pins at ${long_strike:,.0f} on expiry")
+        with c5:
+            if breakeven is not None:
+                st.metric(
+                    "Upper Breakeven" if is_call else "Lower Breakeven",
+                    f"${breakeven:,.2f}",
+                    delta=f"{(breakeven/S - 1)*100:+.1f}% from spot",
+                    delta_color="off",
+                )
+
+        # ── Greeks ────────────────────────────────────────────────────────────
+        st.markdown("**Greeks (1×2 combined position)**")
+        gc1, gc2, gc3, gc4 = st.columns(4)
+        with gc1:
+            val = f"{net_delta:+.3f}" if net_delta is not None else "N/A"
+            st.metric("Net Δ Delta", val, help="Positive = bullish exposure")
+        with gc2:
+            val = f"{net_gamma:+.4f}" if net_gamma is not None else "N/A"
+            st.metric("Net Γ Gamma", val, help="Positive gamma = accelerating delta")
+        with gc3:
+            val = f"${net_theta_daily:+.2f}/d" if net_theta_daily is not None else "N/A"
+            st.metric("Net Θ Theta", val, help="Daily time decay (positive = earn, negative = pay)")
+        with gc4:
+            val = f"${net_vega_per_pct:+.2f}" if net_vega_per_pct is not None else "N/A"
+            st.metric(f"Net Vega {iv_quality}", val, help=f"P&L per 1% IV change · IV Rank: {iv_rank:.0f}%")
+
+        # ── Entry conditions ───────────────────────────────────────────────────
+        factors = []
+        rsi9 = float(row.get("rsi9", 50))
+        macro = str(row.get("macro_trend", ""))
+
+        # Sentiment
+        if (is_call and macro == "BULLISH" and rsi9 > 50) or (not is_call and macro == "BEARISH" and rsi9 < 50):
+            factors.append(("🟢", "Sentiment", "Strong directional alignment"))
+        elif macro in ("BULLISH", "BEARISH"):
+            factors.append(("🟡", "Sentiment", "Directional but weak momentum"))
+        else:
+            factors.append(("🔴", "Sentiment", "Neutral trend — no directional edge"))
+
+        # IV environment
+        if iv_rank < 35:
+            factors.append(("🟢", "IV Env", f"Low IV Rank ({iv_rank:.0f}%) — ideal for long vega"))
+        elif iv_rank < 55:
+            factors.append(("🟡", "IV Env", f"Moderate IV Rank ({iv_rank:.0f}%)"))
+        else:
+            factors.append(("🔴", "IV Env", f"High IV Rank ({iv_rank:.0f}%) — IV crush risk"))
+
+        # Liquidity
+        short_oi = int(row.get("short_oi", 0))
+        short_spread = float(row.get("short_ask", 0)) - float(row.get("short_bid", 0))
+        if short_oi > 500 and short_spread < 0.10:
+            factors.append(("🟢", "Liquidity", f"OI {short_oi:,} · spread ${short_spread:.2f}"))
+        elif short_oi > 100 and short_spread < 0.15:
+            factors.append(("🟡", "Liquidity", f"OI {short_oi:,} · spread ${short_spread:.2f}"))
+        else:
+            factors.append(("🔴", "Liquidity", f"OI {short_oi:,} · spread ${short_spread:.2f}"))
+
+        # Cost basis
+        if net_credit >= 0:
+            factors.append(("🟢", "Cost Basis", f"Net credit ${net_credit:.2f} — enter for free"))
+        elif -net_credit <= 0.30:
+            factors.append(("🟡", "Cost Basis", f"Small debit ${-net_credit:.2f}"))
+        else:
+            factors.append(("🔴", "Cost Basis", f"Debit ${-net_credit:.2f} — expensive entry"))
+
+        # Spread width relative to stock price
+        width_pct = spread_width / S * 100
+        if width_pct <= 3:
+            factors.append(("🟢", "Spread Width", f"${spread_width:.0f} ({width_pct:.1f}% of spot)"))
+        elif width_pct <= 5:
+            factors.append(("🟡", "Spread Width", f"${spread_width:.0f} ({width_pct:.1f}% of spot)"))
+        else:
+            factors.append(("🔴", "Spread Width", f"${spread_width:.0f} ({width_pct:.1f}% — wide danger zone)"))
+
+        greens = sum(1 for e, _, _ in factors if e == "🟢")
+        reds = sum(1 for e, _, _ in factors if e == "🔴")
+        if greens >= 3 and reds == 0:
+            verdict = "✅ RECOMMEND"
+            verdict_color = "#28a745"
+        elif reds >= 2:
+            verdict = "❌ SKIP"
+            verdict_color = "#dc3545"
+        else:
+            verdict = "⚠️ MARGINAL"
+            verdict_color = "#ffc107"
+
+        st.markdown("**Entry Score**")
+        pill_cols = st.columns(len(factors))
+        for i, (emoji_v, label_v, detail_v) in enumerate(factors):
+            with pill_cols[i]:
+                st.markdown(
+                    f'<div style="text-align:center; font-size:1.3em;">{emoji_v}</div>'
+                    f'<div style="text-align:center; font-size:0.75em; font-weight:bold;">{label_v}</div>'
+                    f'<div style="text-align:center; font-size:0.65em; color:#888;">{detail_v}</div>',
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown(
+            f'<div style="text-align:center; font-weight:bold; color:{verdict_color}; '
+            f'font-size:1.1em; margin-top:8px;">{verdict}</div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── P&L Table ─────────────────────────────────────────────────────────
+        with st.expander("📊 P&L at Expiration", expanded=False):
+            pnl_df = _backspread_pnl_table(row)
+
+            def _highlight_pnl(row_data):
+                if row_data["⚠️"]:
+                    return ["background-color: #3a300e; color: #ffeeba"] * len(row_data)
+                if row_data["P&L"].startswith("$+"):
+                    return ["color: #28a745"] * len(row_data)
+                if row_data["P&L"].startswith("$-"):
+                    return ["color: #dc3545"] * len(row_data)
+                return [""] * len(row_data)
+
+            st.dataframe(
+                pnl_df.style.apply(_highlight_pnl, axis=1),
+                hide_index=True,
+                use_container_width=True,
+            )
+            dz_low = float(row.get("danger_zone_low", short_strike))
+            dz_high = float(row.get("danger_zone_high", long_strike))
+            st.caption(
+                f"⚠️ **Danger zone:** stock pinned between ${dz_low:,.0f}–${dz_high:,.0f} at expiry "
+                f"(max loss = ${abs(max_loss):,.0f}). "
+                f"The trade profits if the stock moves decisively {'above' if is_call else 'below'} "
+                f"the breakeven or stays {'below' if is_call else 'above'} both strikes."
+            )
+
+        # ── Management Plan ────────────────────────────────────────────────────
+        with st.expander("📋 Trade Management", expanded=False):
+            be_pct = abs((breakeven / S - 1) * 100) if breakeven else 0
+            st.markdown(
+                f"**Profit target:** Close for 50% of max theoretical gain once the stock clears "
+                f"**${breakeven:,.2f}** ({'%.1f' % be_pct}% {'above' if is_call else 'below'} spot). "
+                f"At that point the position is deep enough ITM to lock in gains.\n\n"
+                f"**Time stop:** If price is inside the danger zone (${dz_low:,.0f}–${dz_high:,.0f}) "
+                f"with < 7 DTE, close immediately — theta decay accelerates max-loss risk.\n\n"
+                f"**IV crush stop:** If implied volatility drops > 20% from entry level "
+                f"({iv_rank:.0f}% IV Rank today), the positive vega advantage evaporates — "
+                f"consider closing if directional thesis hasn't yet played out.\n\n"
+                f"**Ratchet:** Once the stock has moved 50% of the distance to breakeven, "
+                f"raise your mental stop to entry cost (net credit received or debit paid).\n\n"
+                f"**Conflict note:** If this ticker also shows a 🦓 Zebra score, the Zebra "
+                f"structure offers similar upside with a cleaner risk profile — compare both."
+            )
+
+
+def render_backspread_section(bs_rows: pd.DataFrame) -> None:
+    """Render detailed cards for all backspread results."""
+    if bs_rows.empty:
+        st.info("No qualifying ratio backspread setups found in current screen.")
+        return
+
+    st.markdown(
+        "A **Ratio Backspread** (1×2) sells 1 ATM option and buys 2 OTM options at the same expiry. "
+        "The trade costs little or nothing to enter and profits from a **large directional move** or "
+        "an **IV expansion**. Max loss is limited and occurs only if the stock pins near the long strike. "
+        "Best entered in **low IV environments** (IV Rank < 35) where the long legs are cheap."
+    )
+    st.caption(
+        "⚠️ These are educational setups. Options involve significant risk. "
+        "Verify fills with your broker before trading."
+    )
+
+    call_rows = bs_rows[bs_rows["strategy"] == "CALL_RATIO_BACKSPREAD"]
+    put_rows = bs_rows[bs_rows["strategy"] == "PUT_RATIO_BACKSPREAD"]
+
+    if not call_rows.empty:
+        st.subheader("🚀⬆️ Call Ratio Backspreads")
+        for _, row in call_rows.iterrows():
+            _backspread_card(row)
+
+    if not put_rows.empty:
+        st.subheader("📉⬇️ Put Ratio Backspreads")
+        for _, row in put_rows.iterrows():
+            _backspread_card(row)
 
 
 # ── Zebra — Stock Replacement Screener ───────────────────────────────────────
@@ -2845,7 +3156,7 @@ def main():
     st.title("📊 OTIS — Options Trading Intelligence System")
     st.caption(
         "End-of-Day Screening Engine · Free Data via yfinance · "
-        "17 Options Strategies — Credit · Debit · Income · Volatility"
+        "19 Options Strategies — Credit · Debit · Income · Volatility · Backspreads"
     )
 
     filters = render_sidebar()
@@ -2980,6 +3291,21 @@ def main():
             expanded=False,
         ):
             render_strategy_overview(st.session_state["signals_data"])
+
+    # ── Ratio Backspreads (only when results contain backspread rows) ─────────
+    if st.session_state.get("results_df") is not None and not st.session_state["results_df"].empty:
+        bs_rows = st.session_state["results_df"][
+            st.session_state["results_df"]["strategy"].isin(
+                {"CALL_RATIO_BACKSPREAD", "PUT_RATIO_BACKSPREAD"}
+            )
+        ]
+        if not bs_rows.empty:
+            st.divider()
+            with st.expander(
+                f"📐 Ratio Backspreads — {len(bs_rows)} Unlimited-Profit Setup{'s' if len(bs_rows) != 1 else ''}",
+                expanded=False,
+            ):
+                render_backspread_section(bs_rows)
 
     # ── Zebra screener (always available) ────────────────────────────────────
     st.divider()

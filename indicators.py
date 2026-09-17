@@ -199,6 +199,13 @@ STRATEGY_TRIGGERS: dict = {
     "LONG_STRANGLE": lambda s: (
         s["iv_rank"] < 25 and 40 <= s["rsi9"] <= 60 and _no_bb_touch(s)
     ),
+    # ── Ratio backspreads (long vega, directional — enter in low IV) ──────────
+    "CALL_RATIO_BACKSPREAD": lambda s: (
+        s["macro_trend"] == "BULLISH" and s["rsi9"] < 65 and s["iv_rank"] < 55
+    ),
+    "PUT_RATIO_BACKSPREAD": lambda s: (
+        s["macro_trend"] == "BEARISH" and s["rsi9"] > 35 and s["iv_rank"] < 55
+    ),
 }
 
 

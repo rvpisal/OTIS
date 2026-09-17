@@ -51,6 +51,8 @@ STRATEGY_META: dict[str, dict] = {
     "LONG_PUT":               {"name": "Long Put",              "emoji": "🪂", "color": "#fde2e4", "type": "debit",  "bias": "bearish",    "iv_pref": "low"},
     "LONG_STRADDLE":          {"name": "Long Straddle",         "emoji": "🎯", "color": "#e2e3f3", "type": "debit",  "bias": "volatility", "iv_pref": "low"},
     "LONG_STRANGLE":          {"name": "Long Strangle",         "emoji": "🎪", "color": "#e7dff6", "type": "debit",  "bias": "volatility", "iv_pref": "low"},
+    "CALL_RATIO_BACKSPREAD":  {"name": "Call Ratio Backspread", "emoji": "🚀⬆️", "color": "#e3f2fd", "type": "debit", "bias": "bullish",    "iv_pref": "low"},
+    "PUT_RATIO_BACKSPREAD":   {"name": "Put Ratio Backspread",  "emoji": "📉⬇️", "color": "#fce4ec", "type": "debit", "bias": "bearish",    "iv_pref": "low"},
 }
 
 # Only vertical credit structures have a meaningful credit-to-width ratio;
@@ -74,6 +76,47 @@ try:
 except ImportError:
     _HAS_PYVOLLIB = False
     logger.warning("py_vollib not installed; falling back to moneyness proxy for delta")
+
+try:
+    from py_vollib.black_scholes.greeks.analytical import (
+        gamma as _pvl_gamma,
+        theta as _pvl_theta,
+        vega as _pvl_vega,
+    )
+    _HAS_PYVOLLIB_GREEKS = True
+except ImportError:
+    _HAS_PYVOLLIB_GREEKS = False
+
+
+def _compute_bs_greeks(flag: str, S: float, K: float, t: float, r: float, sigma: float) -> dict:
+    """Per-share BSM greeks for one leg. Falls back to zeros if no library available."""
+    out = {"delta": 0.0, "gamma": 0.0, "theta_daily": 0.0, "vega_per_pct": 0.0}
+    if t <= 0 or sigma <= 0 or K <= 0 or S <= 0:
+        return out
+    out["delta"] = get_delta(flag, S, K, sigma * 100.0, max(1, int(t * 365)), r)
+    if _HAS_PYVOLLIB_GREEKS:
+        try:
+            out["gamma"] = float(_pvl_gamma(flag, S, K, t, r, sigma))
+            # py_vollib theta: already $/day
+            out["theta_daily"] = float(_pvl_theta(flag, S, K, t, r, sigma))
+            # py_vollib vega: already $/1%-IV-change
+            out["vega_per_pct"] = float(_pvl_vega(flag, S, K, t, r, sigma))
+        except Exception:
+            pass
+    elif _HAS_MIBIAN:
+        try:
+            m = mibian.BS([S, K, r * 100, max(1, int(t * 365))], volatility=sigma * 100.0)
+            if flag == "c":
+                out["gamma"] = float(m.callGamma)
+                out["theta_daily"] = float(m.callTheta)   # mibian: already per day
+                out["vega_per_pct"] = float(m.callVega)   # mibian: per 1% IV
+            else:
+                out["gamma"] = float(m.putGamma)
+                out["theta_daily"] = float(m.putTheta)
+                out["vega_per_pct"] = float(m.putVega)
+        except Exception:
+            pass
+    return out
 
 
 # ── Delta approximation ───────────────────────────────────────────────────────
@@ -1356,6 +1399,292 @@ class StrategySelector:
     def evaluate_long_put(self) -> dict | None:
         return self._evaluate_long_single("p")
 
+    # ── Ratio Backspreads ─────────────────────────────────────────────────────
+
+    def _select_bs_expiration_window(self, chain_df: pd.DataFrame) -> pd.DataFrame:
+        """Like _select_expiration_window but targets 30-60 DTE for backspreads."""
+        if chain_df is None or chain_df.empty:
+            return pd.DataFrame()
+        ideal = chain_df[(chain_df["dte"] >= 30) & (chain_df["dte"] <= 60)]
+        if not ideal.empty:
+            return ideal.reset_index(drop=True)
+        fallback = chain_df[(chain_df["dte"] >= 21) & (chain_df["dte"] <= 75)]
+        if fallback.empty:
+            return pd.DataFrame()
+        exp_dtes = fallback.groupby("expiration")["dte"].first()
+        best_exp = (exp_dtes - 45).abs().idxmin()
+        return fallback[fallback["expiration"] == best_exp].reset_index(drop=True)
+
+    def _find_backspread_long_candidates(
+        self,
+        chain_df: pd.DataFrame,
+        flag: str,
+        short_strike: float,
+        direction: str,  # "above" for calls, "below" for puts
+    ) -> list[pd.Series]:
+        """Return all valid OTM long-leg candidates for the backspread, sorted closest-to-target-delta.
+        Delta range 0.15–0.45 to handle both skewed and flat-IV markets."""
+        if direction == "above":
+            eligible = chain_df[chain_df["strike"] > short_strike].copy()
+        else:
+            eligible = chain_df[chain_df["strike"] < short_strike].copy()
+
+        if eligible.empty:
+            return []
+
+        candidates: list[tuple[float, pd.Series]] = []
+        delta_target = 0.30
+
+        for _, row in eligible.iterrows():
+            K = float(row.get("strike", 0))
+            if K <= 0:
+                continue
+
+            long_bid = float(row.get("bid", float("nan")))
+            long_ask = float(row.get("ask", float("nan")))
+            if pd.isna(long_bid) or long_bid < 0.05:
+                continue
+            if pd.isna(long_ask) or long_ask <= 0:
+                continue
+
+            long_mid_val = (long_bid + long_ask) / 2.0
+            if long_mid_val > 0 and (long_ask - long_bid) / long_mid_val > 0.15:
+                continue
+
+            long_oi = int(row.get("openInterest", 0))
+            if long_oi < 100:
+                continue
+
+            raw_iv = row.get("iv_pct", None)
+            iv = None if (raw_iv is None or pd.isna(raw_iv) or raw_iv <= 0) else float(raw_iv)
+            dte = int(row.get("dte", 35))
+            d = get_delta(flag, self.S, K, iv, dte, self.r)
+            abs_d = abs(d)
+
+            if not (0.15 <= abs_d <= 0.45):
+                continue
+
+            candidates.append((abs(abs_d - delta_target), row.copy()))
+
+        candidates.sort(key=lambda x: x[0])
+        return [r for _, r in candidates]
+
+    def evaluate_call_ratio_backspread(self) -> dict | None:
+        """1×2 Call Ratio Backspread: Sell 1 ATM call, Buy 2 OTM calls."""
+        from indicators import STRATEGY_TRIGGERS
+        if not STRATEGY_TRIGGERS["CALL_RATIO_BACKSPREAD"](self.signals):
+            return None
+        if not self.options_data:
+            return None
+
+        calls_raw = self.options_data.get("calls", pd.DataFrame())
+        calls = self._select_bs_expiration_window(calls_raw)
+        if calls.empty:
+            return None
+
+        short_leg = self._find_short_leg(
+            calls, "c",
+            delta_low=0.44, delta_high=0.60, delta_target=0.50,
+            require_oi=False,
+            max_strike_dist=0.06,
+        )
+        if short_leg is None:
+            return None
+
+        short_strike = float(short_leg["strike"])
+        short_bid = float(short_leg.get("bid", float("nan")))
+        short_ask = float(short_leg.get("ask", float("nan")))
+        if pd.isna(short_bid) or pd.isna(short_ask) or short_bid <= 0:
+            return None
+        short_oi = int(short_leg.get("openInterest", 0))
+        if short_oi < 100:
+            return None
+        short_mid = (short_bid + short_ask) / 2.0
+
+        long_candidates = self._find_backspread_long_candidates(calls, "c", short_strike, "above")
+        long_leg = None
+        for cand in long_candidates:
+            cand_mid = (float(cand.get("bid", 0)) + float(cand.get("ask", 0))) / 2.0
+            if short_mid - 2.0 * cand_mid >= -0.50:
+                long_leg = cand
+                break
+
+        if long_leg is None:
+            return None
+
+        long_strike = float(long_leg["strike"])
+        long_bid = float(long_leg.get("bid", float("nan")))
+        long_ask = float(long_leg.get("ask", float("nan")))
+        long_mid = (long_bid + long_ask) / 2.0
+        long_oi = int(long_leg.get("openInterest", 0))
+
+        net_credit = short_mid - 2.0 * long_mid
+        if net_credit < -0.50:
+            return None
+
+        spread_width = long_strike - short_strike
+        max_loss = round(-(spread_width - max(0.0, net_credit)) * 100, 2)
+        upper_breakeven = round(2 * long_strike - short_strike - net_credit, 2)
+
+        dte = int(short_leg.get("dte", 35))
+        expiration = str(short_leg.get("expiration", ""))
+        t = max(dte, 1) / 365.0
+
+        raw_iv_s = short_leg.get("iv_pct", 30.0)
+        raw_iv_l = long_leg.get("iv_pct", 30.0)
+        sigma_s = float(raw_iv_s) / 100.0 if (raw_iv_s and not pd.isna(raw_iv_s) and float(raw_iv_s) > 0) else 0.30
+        sigma_l = float(raw_iv_l) / 100.0 if (raw_iv_l and not pd.isna(raw_iv_l) and float(raw_iv_l) > 0) else 0.30
+
+        sg = _compute_bs_greeks("c", self.S, short_strike, t, self.r, sigma_s)
+        lg = _compute_bs_greeks("c", self.S, long_strike, t, self.r, sigma_l)
+        net_delta = round(-sg["delta"] + 2 * lg["delta"], 3)
+        net_gamma = round(-sg["gamma"] + 2 * lg["gamma"], 4)
+        net_theta_daily = round(-sg["theta_daily"] + 2 * lg["theta_daily"], 3)
+        net_vega_per_pct = round(-sg["vega_per_pct"] + 2 * lg["vega_per_pct"], 3)
+
+        iv_rank = self.signals["iv_rank"]
+        iv_quality = "🟢" if iv_rank < 35 else "🟡" if iv_rank < 55 else "🔴"
+
+        return {
+            **self._base_fields("CALL_RATIO_BACKSPREAD"),
+            "short_strike": short_strike,
+            "long_strike": long_strike,
+            "dte": dte,
+            "expiration": expiration,
+            "short_bid": round(short_bid, 2),
+            "short_ask": round(short_ask, 2),
+            "long_bid": round(long_bid, 2),
+            "long_ask": round(long_ask, 2),
+            "short_mid": round(short_mid, 2),
+            "long_mid": round(long_mid, 2),
+            "net_credit": round(net_credit, 2),
+            "credit": round(net_credit, 2) if net_credit > 0 else None,
+            "net_debit": round(-net_credit, 2) if net_credit < 0 else None,
+            "spread_width": round(spread_width, 2),
+            "credit_pct": None,
+            "debit_pct": round(-net_credit / self.S * 100, 1) if net_credit < 0 else 0.0,
+            "max_loss": max_loss,
+            "upper_breakeven": upper_breakeven,
+            "danger_zone_low": short_strike,
+            "danger_zone_high": long_strike,
+            "ratio": "1×2",
+            "net_delta": net_delta,
+            "net_gamma": net_gamma,
+            "net_theta_daily": net_theta_daily,
+            "net_vega_per_pct": net_vega_per_pct,
+            "iv_quality": iv_quality,
+            "short_oi": short_oi,
+            "long_oi": long_oi,
+        }
+
+    def evaluate_put_ratio_backspread(self) -> dict | None:
+        """1×2 Put Ratio Backspread: Sell 1 ATM put, Buy 2 OTM puts."""
+        from indicators import STRATEGY_TRIGGERS
+        if not STRATEGY_TRIGGERS["PUT_RATIO_BACKSPREAD"](self.signals):
+            return None
+        if not self.options_data:
+            return None
+
+        puts_raw = self.options_data.get("puts", pd.DataFrame())
+        puts = self._select_bs_expiration_window(puts_raw)
+        if puts.empty:
+            return None
+
+        short_leg = self._find_short_leg(
+            puts, "p",
+            delta_low=0.44, delta_high=0.60, delta_target=0.50,
+            require_oi=False,
+            max_strike_dist=0.06,
+        )
+        if short_leg is None:
+            return None
+
+        short_strike = float(short_leg["strike"])
+        short_bid = float(short_leg.get("bid", float("nan")))
+        short_ask = float(short_leg.get("ask", float("nan")))
+        if pd.isna(short_bid) or pd.isna(short_ask) or short_bid <= 0:
+            return None
+        short_oi = int(short_leg.get("openInterest", 0))
+        if short_oi < 100:
+            return None
+        short_mid = (short_bid + short_ask) / 2.0
+
+        long_candidates = self._find_backspread_long_candidates(puts, "p", short_strike, "below")
+        long_leg = None
+        for cand in long_candidates:
+            cand_mid = (float(cand.get("bid", 0)) + float(cand.get("ask", 0))) / 2.0
+            if short_mid - 2.0 * cand_mid >= -0.50:
+                long_leg = cand
+                break
+
+        if long_leg is None:
+            return None
+
+        long_strike = float(long_leg["strike"])
+        long_bid = float(long_leg.get("bid", float("nan")))
+        long_ask = float(long_leg.get("ask", float("nan")))
+        long_mid = (long_bid + long_ask) / 2.0
+        long_oi = int(long_leg.get("openInterest", 0))
+
+        net_credit = short_mid - 2.0 * long_mid
+        if net_credit < -0.50:
+            return None
+
+        spread_width = short_strike - long_strike
+        max_loss = round(-(spread_width - max(0.0, net_credit)) * 100, 2)
+        lower_breakeven = round(2 * long_strike - short_strike + net_credit, 2)
+
+        dte = int(short_leg.get("dte", 35))
+        expiration = str(short_leg.get("expiration", ""))
+        t = max(dte, 1) / 365.0
+
+        raw_iv_s = short_leg.get("iv_pct", 30.0)
+        raw_iv_l = long_leg.get("iv_pct", 30.0)
+        sigma_s = float(raw_iv_s) / 100.0 if (raw_iv_s and not pd.isna(raw_iv_s) and float(raw_iv_s) > 0) else 0.30
+        sigma_l = float(raw_iv_l) / 100.0 if (raw_iv_l and not pd.isna(raw_iv_l) and float(raw_iv_l) > 0) else 0.30
+
+        sg = _compute_bs_greeks("p", self.S, short_strike, t, self.r, sigma_s)
+        lg = _compute_bs_greeks("p", self.S, long_strike, t, self.r, sigma_l)
+        net_delta = round(-sg["delta"] + 2 * lg["delta"], 3)
+        net_gamma = round(-sg["gamma"] + 2 * lg["gamma"], 4)
+        net_theta_daily = round(-sg["theta_daily"] + 2 * lg["theta_daily"], 3)
+        net_vega_per_pct = round(-sg["vega_per_pct"] + 2 * lg["vega_per_pct"], 3)
+
+        iv_rank = self.signals["iv_rank"]
+        iv_quality = "🟢" if iv_rank < 35 else "🟡" if iv_rank < 55 else "🔴"
+
+        return {
+            **self._base_fields("PUT_RATIO_BACKSPREAD"),
+            "short_strike": short_strike,
+            "long_strike": long_strike,
+            "dte": dte,
+            "expiration": expiration,
+            "short_bid": round(short_bid, 2),
+            "short_ask": round(short_ask, 2),
+            "long_bid": round(long_bid, 2),
+            "long_ask": round(long_ask, 2),
+            "short_mid": round(short_mid, 2),
+            "long_mid": round(long_mid, 2),
+            "net_credit": round(net_credit, 2),
+            "credit": round(net_credit, 2) if net_credit > 0 else None,
+            "net_debit": round(-net_credit, 2) if net_credit < 0 else None,
+            "spread_width": round(spread_width, 2),
+            "credit_pct": None,
+            "debit_pct": round(-net_credit / self.S * 100, 1) if net_credit < 0 else 0.0,
+            "max_loss": max_loss,
+            "lower_breakeven": lower_breakeven,
+            "danger_zone_low": long_strike,
+            "danger_zone_high": short_strike,
+            "ratio": "1×2",
+            "net_delta": net_delta,
+            "net_gamma": net_gamma,
+            "net_theta_daily": net_theta_daily,
+            "net_vega_per_pct": net_vega_per_pct,
+            "iv_quality": iv_quality,
+            "short_oi": short_oi,
+            "long_oi": long_oi,
+        }
+
     def run(self) -> list[dict]:
         ccs = self.evaluate_call_credit_spread()
         pcs = self.evaluate_put_credit_spread()
@@ -1377,6 +1706,8 @@ class StrategySelector:
             self.evaluate_long_put(),
             self.evaluate_long_straddle(),
             self.evaluate_long_strangle(),
+            self.evaluate_call_ratio_backspread(),
+            self.evaluate_put_ratio_backspread(),
         ]
         return [r for r in results if r is not None]
 
