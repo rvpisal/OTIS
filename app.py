@@ -967,6 +967,23 @@ def format_legs(row: pd.Series) -> str:
 
 # ── Styling ───────────────────────────────────────────────────────────────────
 
+def _attach_zebra_col(results_df: pd.DataFrame, signals_data: dict) -> pd.DataFrame:
+    """Add a 'zebra' column from already-computed _entry_confirmation data (zero extra network calls)."""
+    results_df = results_df.copy()
+    zebra_map = {}
+    for t, s in signals_data.items():
+        ec = s.get("_entry_confirmation")
+        if s.get("macro_trend") == "BULLISH" and ec and ec.get("status") != "conflicting":
+            zebra_map[t] = f"{ec['status_emoji']} {ec['score_raw']}/5"
+        else:
+            zebra_map[t] = "—"
+    if not results_df.empty and "ticker" in results_df.columns:
+        results_df["🦓"] = results_df["ticker"].map(zebra_map).fillna("—")
+    else:
+        results_df["🦓"] = "—"
+    return results_df
+
+
 def style_results_df(df: pd.DataFrame):
     # Per-strategy leg description replaces the ambiguous flat strike/expiry
     # columns (their meaning varied by strategy — front vs back month, body vs
@@ -978,7 +995,7 @@ def style_results_df(df: pd.DataFrame):
     DISPLAY_COLS = [
         "filter_status",
         "confidence",
-        "ticker", "current_price", "macro_trend", "rsi9", "iv_rank",
+        "ticker", "current_price", "macro_trend", "🦓", "rsi9", "iv_rank",
         "strategy", "legs", "dte",
         "short_oi", "credit", "net_debit", "credit_pct", "debit_pct", "max_loss",
     ]
@@ -1046,6 +1063,14 @@ def style_results_df(df: pd.DataFrame):
             pass
         return ""
 
+    def zebra_cell(val):
+        v = str(val)
+        if v.startswith("🟢"):
+            return "background-color: #1e3a2f; color: #c3e6cb; font-weight: bold"
+        if v.startswith("🟡"):
+            return "background-color: #3a300e; color: #ffeeba; font-weight: bold"
+        return ""
+
     styler = display_df.style.apply(row_bg, axis=1)
     if "filter_status" in display_df.columns:
         styler = styler.map(filter_status_cell, subset=["filter_status"])
@@ -1053,6 +1078,8 @@ def style_results_df(df: pd.DataFrame):
         styler = styler.map(confidence_cell, subset=["confidence"])
     if "short_oi" in display_df.columns:
         styler = styler.map(oi_cell, subset=["short_oi"])
+    if "🦓" in display_df.columns:
+        styler = styler.map(zebra_cell, subset=["🦓"])
 
     fmt = {
         "current_price": "${:.2f}",
@@ -2827,6 +2854,10 @@ def main():
     if "results_df" not in st.session_state:
         cached = load_cache()
         if cached:
+            if "🦓" not in cached.get("results_df", pd.DataFrame()).columns:
+                cached["results_df"] = _attach_zebra_col(
+                    cached["results_df"], cached.get("signals_data", {})
+                )
             st.session_state.update(cached)
         else:
             st.session_state.update({
@@ -2895,6 +2926,7 @@ def main():
                 phase2_bar=ph2_bar,
                 status_text=status_text,
             )
+            results_df = _attach_zebra_col(results_df, signals_data)
             st.session_state.update({
                 "results_df": results_df,
                 "signals_data": signals_data,
